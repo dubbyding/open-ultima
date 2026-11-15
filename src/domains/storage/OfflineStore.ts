@@ -279,7 +279,10 @@ export class OfflineStore {
       date: record.date,
       hrSamples: record.hrSamples !== undefined ? [...record.hrSamples] : base.hrSamples,
       stepBuckets48: record.stepBuckets48 !== undefined ? [...record.stepBuckets48] : base.stepBuckets48,
+      sleepSegments: record.sleepSegments !== undefined ? record.sleepSegments.map((x) => ({ ...x })) : base.sleepSegments,
     };
+    if (candidate.stepBuckets48 === undefined) delete candidate.stepBuckets48;
+    if (candidate.sleepSegments === undefined) delete candidate.sleepSegments;
     const errors: string[] = [];
     const validated = this.mustValidate(
       validateHealthRecord(candidate, 'healthRecord', errors),

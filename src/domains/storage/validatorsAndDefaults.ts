@@ -6,7 +6,7 @@
 import {
   ANC_MODE, CASE_GESTURE, DEVICE_KIND, EARBUD_CHIP, EARBUD_GESTURE, EQ_BAND_COUNT, MAX_WATCH_ALARMS, OFFLINE_STATE_VERSION, VOICE_LANGUAGE,
 } from './types.ts';
-import type {
+import type { SleepSegmentRecord,
   CaseGesture, CaseKeyAction, CustomEqProfile, DailyHealthRecord, EarbudGesture, EarbudKeyFunction,
   EarbudKeyMappings, EarbudPrefs, GpsWaypoint, GpsWorkoutRoute, LastKnownLocation, OfflineAppState,
   PairedDeviceRecord, WatchAlarmRecord, WatchSettings,
@@ -159,6 +159,8 @@ export function cloneHealthRecord(r: DailyHealthRecord): DailyHealthRecord {
   const copy: DailyHealthRecord = { ...r, hrSamples: [...r.hrSamples] };
   if (r.stepBuckets48 !== undefined) copy.stepBuckets48 = [...r.stepBuckets48];
   else delete copy.stepBuckets48;
+  if (r.sleepSegments !== undefined) copy.sleepSegments = r.sleepSegments.map((s) => ({ ...s }));
+  else delete copy.sleepSegments;
   return copy;
 }
 
@@ -319,6 +321,16 @@ export function validateHealthRecord(raw: unknown, path: string, errors: string[
     }
     stepBuckets48 = [...raw.stepBuckets48];
   }
+  let sleepSegments: SleepSegmentRecord[] | undefined;
+  if (raw.sleepSegments !== undefined) {
+    const stages = ['awake', 'light', 'deep', 'rem'];
+    const ok = Array.isArray(raw.sleepSegments) && raw.sleepSegments.length <= 200 && raw.sleepSegments.every((s: unknown) =>
+      isPlainObject(s) && stages.includes(s.stage as string) &&
+      typeof s.start === 'string' && typeof s.end === 'string' &&
+      !Number.isNaN(Date.parse(s.start)) && Date.parse(s.end) > Date.parse(s.start));
+    if (!ok) return failValidation(errors, `${path}.sleepSegments must be a list of {stage, start, end} with valid times`);
+    sleepSegments = (raw.sleepSegments as SleepSegmentRecord[]).map((s) => ({ stage: s.stage, start: s.start, end: s.end }));
+  }
   return {
     date: raw.date, steps: raw.steps as number, distanceMeters: raw.distanceMeters as number,
     caloriesKcal: raw.caloriesKcal as number, deepSleepMin: raw.deepSleepMin as number,
@@ -327,6 +339,7 @@ export function validateHealthRecord(raw: unknown, path: string, errors: string[
     spo2Percent: raw.spo2Percent as number, systolicBp: raw.systolicBp as number,
     diastolicBp: raw.diastolicBp as number, stressScore: raw.stressScore as number,
     ...(stepBuckets48 !== undefined ? { stepBuckets48 } : {}),
+    ...(sleepSegments !== undefined ? { sleepSegments } : {}),
   };
 }
 

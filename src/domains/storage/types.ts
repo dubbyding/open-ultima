@@ -210,12 +210,22 @@ export interface EarbudPrefsPatch {
   };
 }
 
+export type SleepStageName = 'awake' | 'light' | 'deep' | 'rem';
+
+export interface SleepSegmentRecord {
+  stage: SleepStageName;
+  start: string;
+  end: string;
+}
+
 export interface DailyHealthRecord {
   date: string;
   steps: number;
   distanceMeters: number;
   caloriesKcal: number;
   stepBuckets48?: number[];
+  /** Last night's sleep stages with real times (ISO 8601), when the watch reported them. */
+  sleepSegments?: SleepSegmentRecord[];
   deepSleepMin: number;
   lightSleepMin: number;
   remSleepMin: number;
