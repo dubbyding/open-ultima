@@ -1,24 +1,24 @@
 import {
   DEVICE_CHIP,
   getProductById,
-} from '../../../protocols/ultimaLinkConstants.ts';
+} from '../../../src/protocols/ultimaLinkConstants.ts';
 import type {
   DeviceChip,
   ProductSpec,
-} from '../../../protocols/ultimaLinkConstants.ts';
+} from '../../../src/protocols/ultimaLinkConstants.ts';
 import {
   bytesToHex,
   encodeUltimaLinkAdv,
   parseUltimaLinkAdv,
-} from '../../../protocols/ultimaLinkAdvParser.ts';
+} from '../../../src/protocols/ultimaLinkAdvParser.ts';
 import {
   CRP_MCU_PLATFORM,
   encodeCrpScanRecord,
   parseCrpScanRecord,
-} from '../../../protocols/ultimaFitCrrepa.ts';
-import { DEVICE_KIND } from '../../../storage/offlineStore.ts';
-import { PACKET_PROTOCOL } from '../types.ts';
-import type { DiscoveredDevice } from '../types.ts';
+} from '../../../src/protocols/ultimaFitCrrepa.ts';
+import { DEVICE_KIND } from '../../../src/storage/offlineStore.ts';
+import { PACKET_PROTOCOL } from '../../../src/domains/bluetooth/types.ts';
+import type { DiscoveredDevice } from '../../../src/domains/bluetooth/types.ts';
 
 export interface SimEarbudsFixture {
   readonly id: string;
@@ -181,7 +181,6 @@ export function buildSimulatedDiscovery(): SimulatedDiscoveryResult {
       offlineVerified: parsed.offlineVerified,
       advInfo: parsed,
       rawAdvHex: bytesToHex(rawAdv, ' '),
-      isSimulated: true,
     };
     devices.push(device);
     advPackets.push({
@@ -221,7 +220,6 @@ export function buildSimulatedDiscovery(): SimulatedDiscoveryResult {
       functionMask: parsed.functionMask,
       crpFunctionMask: parsed.functionMask,
       rawAdvHex: bytesToHex(scanRecord, ' '),
-      isSimulated: true,
     };
     devices.push(device);
     advPackets.push({

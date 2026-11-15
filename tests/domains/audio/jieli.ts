@@ -318,3 +318,25 @@ test('4.3 Jieli Custom Ultima EQ (0xFF), CustomEq (0x08), SearchDev (0x19), SetA
 
   assert.deepEqual(packJieliLtv(0x04, Uint8Array.of(0xaa, 0xbb)), Uint8Array.of(3, 0x04, 0xaa, 0xbb));
 });
+
+test('4.4 Jieli RCSP auth: E1 (SAFER+) matches native libjl_bluetooth.so vectors', async () => {
+  const { jieliAuthResponse, isJieliAuthMessage, isJieliAuthOk, JIELI_AUTH_OK, saferBias } = await import('../../../src/domains/audio/jieli/auth.ts');
+  const hex = (b: Uint8Array): string => Buffer.from(b).toString('hex');
+  // Expected values produced by emulating function_E1test from Ultima Link 1.0.31's libjl_bluetooth.so.
+  const vectors: Array<[string, string]> = [
+    ['00000000000000000000000000000000', '9e43df377b3a46ce751634667e215de5'],
+    ['122f35c7134d7a46f010e081f60452c2', '49d0aa86f794a98d4205ec0457c6600d'],
+    ['a440d784096482a276e4e25e8a29e520', 'b7f83901c268653cb3c6c57d9d7d4687'],
+    ['f1f2846d91902db00e1acb03139cd11e', 'b006372fd49fa78db71941951212214b'],
+  ];
+  for (const [rand, out] of vectors) {
+    const res = jieliAuthResponse(Buffer.from(`00${rand}`, 'hex'));
+    assert.equal(res[0], 0x01);
+    assert.equal(hex(res.subarray(1)), out);
+  }
+  // SAFER+ bias B2 as stored (reversed) in the native .rodata.
+  assert.deepEqual(Array.from({ length: 16 }, (_, j) => saferBias(2, j)), [0x46, 0x97, 0xb1, 0xba, 0xa3, 0xb7, 0x10, 0x0a, 0xc5, 0x37, 0xb3, 0xc9, 0x5a, 0x28, 0xac, 0x64]);
+  assert.ok(isJieliAuthOk(JIELI_AUTH_OK));
+  assert.ok(isJieliAuthMessage(new Uint8Array(17)));
+  assert.ok(!isJieliAuthMessage(Uint8Array.of(0xfe, 0xdc, 0xba, 0x00, 0x01)));
+});

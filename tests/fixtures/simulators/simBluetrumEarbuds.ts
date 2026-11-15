@@ -9,31 +9,31 @@ import {
   KEY_TYPE,
   VOICE_LANGUAGE as PROTOCOL_VOICE_LANGUAGE,
   WORK_MODE,
-} from '../../../protocols/ultimaLinkConstants.ts';
-import type { ProductSpec } from '../../../protocols/ultimaLinkConstants.ts';
+} from '../../../src/protocols/ultimaLinkConstants.ts';
+import type { ProductSpec } from '../../../src/protocols/ultimaLinkConstants.ts';
 import {
   BluetrumFrameReassembler,
   encodeBluetrumFrame,
-} from '../../../protocols/ultimaLinkBluetrum.ts';
-import type { BluetrumDecodedFrame } from '../../../protocols/ultimaLinkBluetrum.ts';
-import { VOICE_LANGUAGE } from '../../../storage/offlineStore.ts';
+} from '../../../src/protocols/ultimaLinkBluetrum.ts';
+import type { BluetrumDecodedFrame } from '../../../src/protocols/ultimaLinkBluetrum.ts';
+import { VOICE_LANGUAGE } from '../../../src/storage/offlineStore.ts';
 import type {
   CaseGesture,
   EarbudGesture,
   EarbudPrefs,
-} from '../../../storage/offlineStore.ts';
+} from '../../../src/storage/offlineStore.ts';
 import {
   ANC_STORE_TO_PROTOCOL,
   BLUETRUM_CASE_KEY_TYPE_MAP,
   BLUETRUM_KEY_TYPE_MAP,
   normalizeEqGains,
-} from '../controllers/earbudsController.ts';
+} from '../../../src/domains/bluetooth/controllers/earbudsController.ts';
 import {
   concatBytes,
   decodeUtf8,
   encodeUtf8,
   toSignedInt8Byte,
-} from '../controllers/liveBleAdapter.ts';
+} from '../../../src/domains/bluetooth/controllers/liveBleAdapter.ts';
 
 function buildUint16LE(value: number): Uint8Array {
   return Uint8Array.of(value & 0xff, (value >>> 8) & 0xff);

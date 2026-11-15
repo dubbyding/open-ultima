@@ -2,11 +2,11 @@ import {
   CRP_ALARM_REPEAT, CRP_CMD, CRP_GPS_SUBCMD, CRP_SLEEP_STATE, CRP_STRESS_DATE,
   buildCrpFrame, decodeAlarms, encodeCrpWatchTimestamp, encodeGpsHistoryResponse,
   encodeGpsPathChunkFrame, encodeNewAlarm, parseCrpFrame,
-} from '../../../protocols/ultimaFitCrrepa.ts';
-import type { CrpDecodedFrame } from '../../../protocols/ultimaFitCrrepa.ts';
-import type { WatchAlarmRecord, WatchSettings } from '../../../storage/offlineStore.ts';
-import { totalPathDistanceMeters } from '../../../utils/geoMath.ts';
-import { clampInt, concatBytes, encodeUtf8 } from '../controllers/liveBleAdapter.ts';
+} from '../../../src/protocols/ultimaFitCrrepa.ts';
+import type { CrpDecodedFrame } from '../../../src/protocols/ultimaFitCrrepa.ts';
+import type { WatchAlarmRecord, WatchSettings } from '../../../src/storage/offlineStore.ts';
+import { totalPathDistanceMeters } from '../../../src/utils/geoMath.ts';
+import { clampInt, concatBytes, encodeUtf8 } from '../../../src/domains/bluetooth/controllers/liveBleAdapter.ts';
 import type { SimWatchFixture } from './simDiscovery.ts';
 
 interface SimGpsRouteFixture {

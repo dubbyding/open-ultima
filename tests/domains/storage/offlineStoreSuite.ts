@@ -241,7 +241,10 @@ test('6.3 Zero network strings and zero runtime network calls across protocols &
   ]);
   const forbiddenNetworkPattern = /https?:\/\/|wss?:\/\/|\bfetch\(|XMLHttpRequest|\bWebSocket\b|home\/index/;
 
+  // Opt-in online features (off until the user signs in) live alone in these files.
+  const OPT_IN_ONLINE = new Set(['src/domains/healthSync/strava.ts', 'src/domains/sheets/googleSheets.ts']);
   for (const relPath of sourceFiles) {
+    if (OPT_IN_ONLINE.has(relPath.replace(/\\/g, '/'))) continue;
     const content = fs.readFileSync(path.join(REPO_ROOT, relPath), 'utf8');
     assert.equal(
       forbiddenNetworkPattern.test(content),

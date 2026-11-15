@@ -21,11 +21,12 @@ import {
   PACKET_PROTOCOL,
   UltimaBleManager,
 } from '../../../src/services/bleManager.ts';
+import { createTestManager } from '../../fixtures/fakeBlePlx.ts';
 
 test('7.4 UltimaBleManager CRREPA Watch pipeline (syncWatchAll, HR/SpO2/BP measurements, 8-slot Alarms, Notification Push, Settings)', async () => {
   const backend = new MemoryStorageBackend();
   const store = new OfflineStore({ backend });
-  const manager = new UltimaBleManager(store);
+  const manager = createTestManager(store);
   await manager.init();
 
   await manager.connectDevice('sim-watch-magic');
@@ -47,10 +48,12 @@ test('7.4 UltimaBleManager CRREPA Watch pipeline (syncWatchAll, HR/SpO2/BP measu
   assert.ok(snap.watch.sleep.napMinutes > 0);
   assert.ok(snap.watch.stressScore > 0);
 
-  // Single-shot Heart Rate measurement (0x68)
+  // Single-shot Heart Rate measurement must use 0x6D; 0x68 starts training mode on the watch.
+  const hrTx = () => manager.getSnapshot().packetLogs.filter((p) => p.direction === 'TX' && p.target === 'watch').at(-1);
   await manager.measureWatchHeartRate(true);
+  assert.equal(hrTx()?.cmd, 0x6d);
   snap = manager.getSnapshot();
-  assert.equal(snap.watch.measuringHr, true);
+  assert.equal(snap.watch.measuringHr, false, 'a reading ends the one-shot measurement');
   assert.equal(snap.watch.heartRateBpm, 74); // restingHr 68 + 6
   await manager.measureWatchHeartRate(false);
   assert.equal(manager.getSnapshot().watch.measuringHr, false);
@@ -58,7 +61,7 @@ test('7.4 UltimaBleManager CRREPA Watch pipeline (syncWatchAll, HR/SpO2/BP measu
   // Single-shot SpO2 measurement (0x6B)
   await manager.measureWatchSpO2(true);
   snap = manager.getSnapshot();
-  assert.equal(snap.watch.measuringSpo2, true);
+  assert.equal(snap.watch.measuringSpo2, false, 'a reading ends the one-shot measurement');
   assert.equal(snap.watch.spo2Percent, 98);
   await manager.measureWatchSpO2(false);
   assert.equal(manager.getSnapshot().watch.measuringSpo2, false);
@@ -123,7 +126,13 @@ test('7.4 UltimaBleManager CRREPA Watch pipeline (syncWatchAll, HR/SpO2/BP measu
   await manager.setWatchUnits(true);
   await manager.setWatchLanguage(CRP_LANGUAGE.CHINESE);
   await manager.setWatchSedentaryReminder(true);
-  await manager.setWatchHrInterval(15);
+  await manager.setWatchHrInterval(20);
+  {
+    // Official app only accepts 5/10/20/30 min, sent as 5-minute units (1/2/4/6).
+    const tx = manager.getSnapshot().packetLogs.filter((p) => p.direction === 'TX' && p.target === 'watch').at(-1);
+    assert.equal(tx?.cmd, 0x1f);
+    assert.ok(tx?.hex.replace(/\s/g, '').toLowerCase().endsWith('1f04'), `expected 0x1F [04], got ${tx?.hex}`);
+  }
   await manager.setWatchDrinkReminder({
     enabled: true,
     startHour: 9,
@@ -141,7 +150,7 @@ test('7.4 UltimaBleManager CRREPA Watch pipeline (syncWatchAll, HR/SpO2/BP measu
   assert.equal(snap.watch.imperialUnits, true);
   assert.equal(snap.watch.languageId, CRP_LANGUAGE.CHINESE);
   assert.equal(snap.watch.sedentaryReminder, true);
-  assert.equal(snap.watch.hrIntervalMinutes, 15);
+  assert.equal(snap.watch.hrIntervalMinutes, 20);
   assert.equal(snap.watch.drinkReminderPeriod.enabled, true);
   assert.equal(snap.watch.drinkReminderPeriod.startHour, 9);
   assert.equal(snap.watch.drinkReminderPeriod.endHour, 20);
@@ -153,7 +162,7 @@ test('7.4 UltimaBleManager CRREPA Watch pipeline (syncWatchAll, HR/SpO2/BP measu
 test('7.5 UltimaBleManager TX/RX packetLogs hex generation, sendRawHex, 250-entry cap, and OfflineStore persistence', async () => {
   const backend = new MemoryStorageBackend();
   const store1 = new OfflineStore({ backend });
-  const manager1 = new UltimaBleManager(store1);
+  const manager1 = createTestManager(store1);
   await manager1.init();
 
   await manager1.connectDevice('sim-earbuds-xh68b');
@@ -228,7 +237,7 @@ test('7.5 UltimaBleManager TX/RX packetLogs hex generation, sendRawHex, 250-entr
 
   // Verify OfflineStore persistence across a fresh UltimaBleManager + OfflineStore sharing backend
   const store2 = new OfflineStore({ backend });
-  const manager2 = new UltimaBleManager(store2);
+  const manager2 = createTestManager(store2);
   await manager2.init();
 
   const hydrated = manager2.getSnapshot();

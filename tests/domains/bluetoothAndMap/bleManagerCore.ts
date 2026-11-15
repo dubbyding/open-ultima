@@ -14,20 +14,20 @@ import {
   OfflineStore,
 } from '../../../src/storage/offlineStore.ts';
 import {
-  CONNECTION_MODE,
   PACKET_DIRECTION,
   PACKET_PROTOCOL,
   UltimaBleManager,
 } from '../../../src/services/bleManager.ts';
+import { createTestManager } from '../../fixtures/fakeBlePlx.ts';
 
 // ---------------------------------------------------------------------------
-// 7. UltimaBleManager Simulator Integration Tests
+// 7. UltimaBleManager integration tests (live BLE path over fake radio)
 // ---------------------------------------------------------------------------
 
 test('7.1 UltimaBleManager startScan() discovers both Earbuds and Watch with decoded ADV fields & logs RX ADV packets', async () => {
   const backend = new MemoryStorageBackend();
   const store = new OfflineStore({ backend });
-  const manager = new UltimaBleManager(store);
+  const manager = createTestManager(store);
 
   const snapshots: number[] = [];
   const unsubscribe = manager.subscribe((snap) => {
@@ -36,7 +36,6 @@ test('7.1 UltimaBleManager startScan() discovers both Earbuds and Watch with dec
 
   await manager.init();
   assert.equal(manager.getSnapshot().initialized, true);
-  assert.equal(manager.getSnapshot().mode, CONNECTION_MODE.SIMULATOR);
 
   const discovered = await manager.startScan();
   assert.ok(discovered.length >= 4);
@@ -53,7 +52,6 @@ test('7.1 UltimaBleManager startScan() discovers both Earbuds and Watch with dec
   assert.equal(btEarbuds.edrMac, 'AA:BB:CC:11:22:0A');
   assert.equal(btEarbuds.license, 'ultimaxh68banc0a');
   assert.equal(btEarbuds.offlineVerified, true);
-  assert.equal(btEarbuds.isSimulated, true);
   assert.ok(btEarbuds.rawAdvHex.length > 0);
 
   // Verify Jieli Earbuds ADV decoding (Prime 1.0 PID 0x0001)
@@ -96,7 +94,7 @@ test('7.1 UltimaBleManager startScan() discovers both Earbuds and Watch with dec
 test('7.2 UltimaBleManager simultaneous dual connection (Earbuds + Watch) and Bluetrum Earbuds full control pipeline', async () => {
   const backend = new MemoryStorageBackend();
   const store = new OfflineStore({ backend });
-  const manager = new UltimaBleManager(store);
+  const manager = createTestManager(store);
   await manager.init();
   await manager.startScan();
 
@@ -191,7 +189,7 @@ test('7.2 UltimaBleManager simultaneous dual connection (Earbuds + Watch) and Bl
 test('7.3 UltimaBleManager Jieli RCSP Earbuds pipeline (Ultima Signature/Balance EQ 0xFF, Custom EQ CRC-16, ANC, Work Mode, Keys, SearchDev)', async () => {
   const backend = new MemoryStorageBackend();
   const store = new OfflineStore({ backend });
-  const manager = new UltimaBleManager(store);
+  const manager = createTestManager(store);
   await manager.init();
   await manager.startScan();
 
@@ -235,11 +233,14 @@ test('7.3 UltimaBleManager Jieli RCSP Earbuds pipeline (Ultima Signature/Balance
   await manager.setEarbudsGameMode(true);
   assert.equal(manager.getSnapshot().earbuds.gameMode, true);
 
-  await manager.setEarbudsKeyMapping('left', 'longPress', KEY_FUNCTION.ANC_MODE);
-  assert.equal(
-    manager.getSnapshot().earbuds.keyMappings.left.longPress,
-    KEY_FUNCTION.ANC_MODE,
-  );
+  // Jieli key functions are Ultima Link's UiFunction codes (play/pause 5, prev 3, next 4, vol+ 9, vol- 10).
+  await manager.setEarbudsKeyMapping('left', 'longPress', KEY_FUNCTION.VOLUME_DOWN);
+  assert.equal(manager.getSnapshot().earbuds.keyMappings.left.longPress, KEY_FUNCTION.VOLUME_DOWN);
+  const keyTx = manager.getSnapshot().packetLogs.filter((p) => p.direction === PACKET_DIRECTION.TX && p.summary.includes('SetKeyMapping')).at(-1);
+  assert.ok(keyTx && keyTx.hex.replace(/\s/g, '').includes('01040a'), `left long-press should carry Jieli fn 0x0a: ${keyTx?.hex}`);
+  await assert.rejects(() => manager.setEarbudsKeyMapping('left', 'longPress', KEY_FUNCTION.ANC_MODE));
+  // The earbuds authenticated before any RCSP command went out.
+  assert.ok(manager.getSnapshot().packetLogs.some((p) => p.summary === 'Unlock: accepted'));
 
   await manager.renameEarbuds('Prime 1.0 Pro');
   assert.equal(manager.getSnapshot().earbuds.deviceName, 'Prime 1.0 Pro');
@@ -250,4 +251,36 @@ test('7.3 UltimaBleManager Jieli RCSP Earbuds pipeline (Ultima Signature/Balance
   assert.equal(manager.getSnapshot().earbuds.findingActive, false);
 
   manager.destroy();
+});
+
+test('7.6 UltimaBleManager blocks scan/connect when BLE permission is denied or Bluetooth is off', async () => {
+  const deniedStore = new OfflineStore({ backend: new MemoryStorageBackend() });
+  const denied = new UltimaBleManager(deniedStore, {
+    liveBleManager: {
+      startDeviceScan() { throw new Error('scan must not start without permission'); },
+      stopDeviceScan() {},
+      async connectToDevice() { throw new Error('connect must not run without permission'); },
+    },
+    ensurePermissions: async () => false,
+  });
+  await denied.init();
+  await assert.rejects(denied.startScan(), /permission denied/i);
+  assert.match(denied.getSnapshot().lastError ?? '', /permission denied/i);
+  await assert.rejects(denied.connectDevice('any-device'), /permission denied/i);
+  denied.destroy();
+
+  const offStore = new OfflineStore({ backend: new MemoryStorageBackend() });
+  const off = new UltimaBleManager(offStore, {
+    liveBleManager: {
+      startDeviceScan() { throw new Error('scan must not start while radio is off'); },
+      stopDeviceScan() {},
+      async connectToDevice() { throw new Error('unused'); },
+      async state() { return 'PoweredOff'; },
+    },
+  });
+  await off.init();
+  await assert.rejects(off.startScan(), /turned off/i);
+  assert.equal(off.getSnapshot().scanning, false);
+  assert.match(off.getSnapshot().lastError ?? '', /turned off/i);
+  off.destroy();
 });

@@ -19,6 +19,9 @@ import {
   decodeStress,
   encodeCrpScanRecord,
   encodeDynamicHeartRate,
+  encodeTrainingStart,
+  encodeTrainingState,
+  decodeTrainingNotification,
   encodeMeasureBloodPressure,
   encodeMeasureHeartRate,
   encodeMeasureSpO2,
@@ -273,6 +276,16 @@ test('5.3 CRREPA Steps & 48-slot buckets, Sleep midnight wrap, HR, SpO2, BP, and
   assert.equal(parseCrpFrame(encodeMeasureHeartRate(true))!.payload[0], 0x00);
   assert.equal(parseCrpFrame(encodeMeasureHeartRate(false))!.payload[0], 0xff);
   assert.equal(parseCrpFrame(encodeDynamicHeartRate(true))!.payload[0], 0x00);
+  // Phone-led workout on the watch (ULTIMA Fit gn3 / z48.q0).
+  assert.deepEqual([...parseCrpFrame(encodeTrainingStart(0x01))!.payload], [0x01]);
+  assert.equal(parseCrpFrame(encodeTrainingStart(0x01))!.cmd, 0x68);
+  assert.deepEqual([...parseCrpFrame(encodeTrainingState('pause'))!.payload], [0xfe]);
+  assert.deepEqual([...parseCrpFrame(encodeTrainingState('resume'))!.payload], [0xfd]);
+  assert.deepEqual([...parseCrpFrame(encodeTrainingState('stop'))!.payload], [0xff]);
+  assert.deepEqual(decodeTrainingNotification(Uint8Array.of(132, 0x01)), { kind: 'heartRate', bpm: 132 });
+  assert.deepEqual(decodeTrainingNotification(Uint8Array.of(0xff, 0x01)), { kind: 'startFailed' });
+  assert.deepEqual(decodeTrainingNotification(Uint8Array.of(0xfe)), { kind: 'state', state: 'paused' });
+  assert.deepEqual(decodeTrainingNotification(Uint8Array.of(0x02)), { kind: 'state', state: 'started', type: 0x02 });
   assert.equal(parseCrpFrame(encodeTimingHeartRateInterval(6))!.payload[0], 6);
   assert.equal(parseCrpFrame(encodeQueryTodayHeartRate(1))!.cmd, CRP_CMD.QUERY_TIMING_HEART_RATE);
   assert.equal(parseCrpFrame(encodeQueryTodayHeartRate(2))!.cmd, CRP_CMD.QUERY_24H_HEART_RATE);

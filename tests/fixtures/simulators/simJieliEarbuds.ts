@@ -4,8 +4,8 @@ import {
   JIELI_ATTR_AND_FUN,
   JIELI_OPCODE,
   getFactoryPresetsForProduct,
-} from '../../../protocols/ultimaLinkConstants.ts';
-import type { ProductSpec } from '../../../protocols/ultimaLinkConstants.ts';
+} from '../../../src/protocols/ultimaLinkConstants.ts';
+import type { ProductSpec } from '../../../src/protocols/ultimaLinkConstants.ts';
 import {
   JIELI_ULTIMA_EQ_TAG,
   JIELI_ULTIMA_EQ_VALUE,
@@ -15,27 +15,27 @@ import {
   parseJieliCustomData,
   parseJieliLtvEntries,
   parseJieliRcspPacket,
-} from '../../../protocols/ultimaLinkJieli.ts';
+} from '../../../src/protocols/ultimaLinkJieli.ts';
 import type {
   JieliKeySetting,
   JieliRcspPacket,
-} from '../../../protocols/ultimaLinkJieli.ts';
-import { EQ_BAND_COUNT, VOICE_LANGUAGE } from '../../../storage/offlineStore.ts';
+} from '../../../src/protocols/ultimaLinkJieli.ts';
+import { EQ_BAND_COUNT, VOICE_LANGUAGE } from '../../../src/storage/offlineStore.ts';
 import type {
   EarbudGesture,
   EarbudPrefs,
-} from '../../../storage/offlineStore.ts';
+} from '../../../src/storage/offlineStore.ts';
 import {
   ANC_STORE_TO_PROTOCOL,
   JIELI_ACTION_BY_GESTURE,
   normalizeEqGains,
-} from '../controllers/earbudsController.ts';
+} from '../../../src/domains/bluetooth/controllers/earbudsController.ts';
 import {
   concatBytes,
   decodeUtf8,
   encodeUtf8,
   toSignedInt8Byte,
-} from '../controllers/liveBleAdapter.ts';
+} from '../../../src/domains/bluetooth/controllers/liveBleAdapter.ts';
 
 /** Deterministic Jieli RCSP GATT responder emitting authentic binary RX frames. */
 export class SimJieliEarbuds {

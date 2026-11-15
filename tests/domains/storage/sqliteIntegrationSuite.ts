@@ -17,6 +17,7 @@ import {
 import type { SqliteDriver } from '../../../src/storage/sqliteEngine.ts';
 import { UltimaBleManager } from '../../../src/services/bleManager.ts';
 import { REPO_ROOT, readCombinedText, resolveSourceFiles } from '../testUtils.ts';
+import { createTestManager } from '../../fixtures/fakeBlePlx.ts';
 
 test('9.2 OfflineStore SQLite integration, SQL queryHealthDateRange, queryHealthAggregates, and gps_waypoints FK/index queries', async () => {
   const driver = createNodeSqliteDriver(':memory:');
@@ -267,7 +268,7 @@ test('9.3 OfflineStore SQLite file-backed persistence across restarts, UltimaBle
       relationalTablesActive: true,
     });
 
-    const manager1 = new UltimaBleManager(store1);
+    const manager1 = createTestManager(store1);
     await manager1.init();
     const scanned = await manager1.startScan();
     const earbuds = scanned.find((d) => d.kind === DEVICE_KIND.EARBUDS)!;
@@ -338,8 +339,8 @@ test('9.3 OfflineStore SQLite file-backed persistence across restarts, UltimaBle
     );
 
     const inspectorSrc = readCombinedText([
-      'src/screens/InspectorBackupScreen.tsx',
-      'src/domains/storage/ui',
+      'src/app/screens/settings/DatabaseScreen.tsx',
+      'src/app/screens/settings/BackupScreen.tsx',
     ]);
     assert.match(inspectorSrc, /getStorageEngineInfo/);
     assert.match(inspectorSrc, /getTableRowCounts/);
@@ -350,7 +351,7 @@ test('9.3 OfflineStore SQLite file-backed persistence across restarts, UltimaBle
     for (const rel of resolveSourceFiles([
       'src/storage',
       'src/domains/storage',
-      'src/screens/InspectorBackupScreen.tsx',
+      'src/app/screens/settings',
     ])) {
       const src = fs.readFileSync(path.join(REPO_ROOT, rel), 'utf8');
       assert.equal(
