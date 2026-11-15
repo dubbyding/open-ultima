@@ -9,10 +9,9 @@ import type {
   EarbudKeyFunction, EarbudKeyMappings, GpsWorkoutRoute, LastKnownLocation,
   OfflineAppState, VoiceLanguage, WatchAlarmRecord, WatchSettings,
 } from '../../storage/offlineStore.ts';
+import type { KeeperStatus } from './controllers/connectionKeeper.ts';
 
 // Exported Bluetooth Transport Constants & State Contracts
-export const CONNECTION_MODE = { SIMULATOR: 'simulator', LIVE_BLE: 'live_ble' } as const;
-export type ConnectionMode = (typeof CONNECTION_MODE)[keyof typeof CONNECTION_MODE];
 
 export const PACKET_DIRECTION = { TX: 'TX', RX: 'RX' } as const;
 export type PacketDirection = (typeof PACKET_DIRECTION)[keyof typeof PACKET_DIRECTION];
@@ -64,7 +63,6 @@ export interface DiscoveredDevice {
   readonly functionMask?: number;
   readonly crpFunctionMask?: number;
   readonly rawAdvHex: string;
-  readonly isSimulated: boolean;
 }
 
 export interface EarbudsBatteryState {
@@ -135,7 +133,30 @@ export interface EarbudsLiveState {
   readonly lastKnownLocation: LastKnownLocation | null;
   readonly sideLocations: EarbudSideLocations;
   readonly capacities: BluetrumDeviceCapacities | null;
+  /**
+   * What these specific earbuds told us they support (Jieli reports it in GetADVInfo).
+   * null = unknown, so the UI offers everything as before.
+   */
+  readonly featureSupport: EarbudFeatureSupport | null;
   readonly lastSyncedAt: number | null;
+}
+
+export interface EarbudFeatureSupport {
+  readonly gestures: readonly EarbudGesture[];
+  readonly keyFunctions: readonly EarbudKeyFunction[];
+  readonly anc: boolean;
+  readonly transparency: boolean;
+  /** Adjustable noise-cancelling / transparency strength. */
+  readonly ancLevels: boolean;
+  readonly gameMode: boolean;
+  readonly inEarDetect: boolean;
+  readonly led: boolean;
+  readonly language: boolean;
+  readonly ldac: boolean;
+  readonly spatialAudio: boolean;
+  readonly dualConnect: boolean;
+  readonly caseKeys: boolean;
+  readonly signatureBalanceEq: boolean;
 }
 
 export interface WatchSleepLiveState {
@@ -230,11 +251,24 @@ export interface WatchLiveState {
   readonly gpsRoutes: GpsWorkoutRoute[];
   readonly gpsSyncing: boolean;
   readonly lastSyncedAt: number | null;
+  /** Workout running on the watch, started from the app or the watch. */
+  readonly training: WatchTrainingLiveState;
+}
+
+export const EMPTY_TRAINING: WatchTrainingLiveState = { active: false, paused: false, type: null, bpm: 0, bpmAt: 0, failed: false };
+
+export interface WatchTrainingLiveState {
+  readonly active: boolean;
+  readonly paused: boolean;
+  readonly type: number | null;
+  /** Latest live heart rate from the workout, with the time it arrived (ms). */
+  readonly bpm: number;
+  readonly bpmAt: number;
+  readonly failed: boolean;
 }
 
 export interface BleManagerSnapshot {
   readonly initialized: boolean;
-  readonly mode: ConnectionMode;
   readonly bleAvailable: boolean;
   readonly scanning: boolean;
   readonly lastError: string | null;
@@ -243,6 +277,8 @@ export interface BleManagerSnapshot {
   readonly watch: WatchLiveState;
   readonly packetLogs: PacketLogEntry[];
   readonly storeState: OfflineAppState;
+  /** Background keep-alive / auto-reconnect state per device kind. */
+  readonly keepAlive: KeeperStatus;
 }
 
 // ---------------------------------------------------------------------------
@@ -274,8 +310,13 @@ export interface BlePlxDeviceLike {
   monitorCharacteristicForService(
     serviceUUID: string, characteristicUUID: string,
     listener: (error: Error | null, characteristic: BlePlxCharacteristicLike | null) => void,
+    transactionId?: string,
   ): BlePlxSubscriptionLike;
   cancelConnection(): Promise<BlePlxDeviceLike>;
+  /** Radio round-trip used as a lightweight keep-alive ping; resolves with `rssi` populated. */
+  readRSSI?(): Promise<BlePlxDeviceLike>;
+  readCharacteristicForService?(serviceUUID: string, characteristicUUID: string): Promise<BlePlxCharacteristicLike>;
+  services?(): Promise<{ uuid: string }[]>;
   onDisconnected(listener: (error: Error | null, device: BlePlxDeviceLike) => void): BlePlxSubscriptionLike;
 }
 
@@ -285,7 +326,11 @@ export interface BlePlxManagerLike {
     listener: (error: Error | null, device: BlePlxDeviceLike | null) => void,
   ): void;
   stopDeviceScan(): void;
-  connectToDevice(deviceId: string): Promise<BlePlxDeviceLike>;
+  connectToDevice(deviceId: string, options?: { timeout?: number; autoConnect?: boolean }): Promise<BlePlxDeviceLike>;
+  /** Cancels an established or still-pending connection attempt. */
+  cancelDeviceConnection?(deviceId: string): Promise<unknown>;
+  /** Adapter power state, e.g. 'PoweredOn' / 'PoweredOff' / 'Unauthorized'. */
+  state?(): Promise<string>;
   destroy?(): void;
 }
 
@@ -372,6 +417,9 @@ export function syncEarbudsState(state: EarbudsLiveState): EarbudsLiveState {
     lastKnownLocation: state.lastKnownLocation ? { ...state.lastKnownLocation } : null,
     sideLocations: deriveEarbudSideLocations(state.lastKnownLocation, state.sideLocations),
     capacities: state.capacities ? { ...state.capacities } : null,
+    featureSupport: state.featureSupport
+      ? { ...state.featureSupport, gestures: [...state.featureSupport.gestures], keyFunctions: [...state.featureSupport.keyFunctions] }
+      : null,
   };
 }
 
@@ -387,6 +435,7 @@ export function syncWatchState(state: WatchLiveState): WatchLiveState {
     deviceName: state.name,
     stepBuckets48: [...state.stepBuckets48],
     sleep: { ...state.sleep, segments: state.sleep.segments.map((s) => ({ ...s })) },
+    training: { ...(state.training ?? EMPTY_TRAINING) },
     sleepDeepMin: state.sleep.deepMinutes, sleepLightMin: state.sleep.lightMinutes,
     sleepRemMin: state.sleep.remMinutes, sleepAwakeMin: state.sleep.awakeMinutes,
     heartRate: { ...state.heartRate, samples24h: [...state.heartRate.samples24h] },
@@ -429,7 +478,7 @@ export function createEmptyEarbudsState(): EarbudsLiveState {
     dualConnect: prefs.dualConnect, ledOn: prefs.ledOn, ledEnabled: prefs.ledOn, autoAnswer: false,
     voiceLanguage: prefs.voiceLanguage, keyMappings: cloneEarbudKeyMappings(prefs.keyMappings),
     finding: false, findingActive: false, lastKnownLocation: null,
-    sideLocations: { left: null, right: null, casePin: null }, capacities: null, lastSyncedAt: null,
+    sideLocations: { left: null, right: null, casePin: null }, capacities: null, featureSupport: null, lastSyncedAt: null,
   });
 }
 
@@ -440,6 +489,7 @@ export function createEmptyWatchState(settings?: WatchSettings): WatchLiveState 
     mac: null, firmwareType: '', firmwareVersion: null, platform: null, chipId: null, functionMask: 0,
     batteryPercent: 0, steps: 0, distanceMeters: 0, caloriesKcal: 0, stepBuckets48: [],
     sleep: { deepMinutes: 0, lightMinutes: 0, remMinutes: 0, awakeMinutes: 0, totalMinutes: 0, napMinutes: 0, segments: [] },
+    training: { ...EMPTY_TRAINING },
     sleepDeepMin: 0, sleepLightMin: 0, sleepRemMin: 0, sleepAwakeMin: 0,
     heartRate: { currentBpm: 0, restingBpm: 0, measuring: false, samples24h: [] },
     heartRateBpm: 0, measuringHr: false, spo2: { percent: 0, measuring: false, samples24h: [] },

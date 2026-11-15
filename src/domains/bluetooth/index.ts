@@ -1,11 +1,10 @@
-export { CONNECTION_MODE, PACKET_DIRECTION, PACKET_PROTOCOL } from './types.ts';
+export { PACKET_DIRECTION, PACKET_PROTOCOL } from './types.ts';
 export type {
   BleManagerSnapshot,
   BlePlxCharacteristicLike,
   BlePlxDeviceLike,
   BlePlxManagerLike,
   BlePlxSubscriptionLike,
-  ConnectionMode,
   DeviceGeoPin,
   DiscoveredDevice,
   EarbudSideLocations,
@@ -27,12 +26,5 @@ export { EQ_FREQUENCIES, UltimaBleManager } from './UltimaBleManager.ts';
 export { LiveBleAdapter, loadBlePlxModule } from './controllers/liveBleAdapter.ts';
 export { EarbudsController } from './controllers/earbudsController.ts';
 export { WatchController } from './controllers/watchController.ts';
-export { SimBluetrumEarbuds } from './simulators/simBluetrumEarbuds.ts';
-export { SimJieliEarbuds } from './simulators/simJieliEarbuds.ts';
-export { SimCrrepaWatch } from './simulators/simCrrepaWatch.ts';
-export {
-  SIM_EARBUDS_FIXTURES,
-  SIM_WATCH_FIXTURES,
-  buildSimulatedDiscovery,
-} from './simulators/simDiscovery.ts';
-export type { SimEarbudsFixture, SimWatchFixture } from './simulators/simDiscovery.ts';
+export { ConnectionKeeper } from './controllers/connectionKeeper.ts';
+export type { KeeperLinkState, KeeperLinkStatus, KeeperStatus, KeptDeviceKind, ReconnectStrategy } from './controllers/connectionKeeper.ts';

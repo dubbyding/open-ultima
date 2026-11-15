@@ -9,27 +9,29 @@ import {
 import { DEVICE_KIND, OfflineStore, createDefaultEarbudPrefs } from '../../storage/offlineStore.ts';
 import type { EarbudPrefsPatch, WatchAlarmRecord, WatchSettingsPatch } from '../../storage/offlineStore.ts';
 import {
-  CONNECTION_MODE, PACKET_DIRECTION, PACKET_PROTOCOL, cloneEarbudKeyMappings, cloneGpsRoutes,
+  PACKET_DIRECTION, PACKET_PROTOCOL, cloneEarbudKeyMappings, cloneGpsRoutes,
   createEmptyEarbudsState, createEmptyWatchState, deriveEarbudSideLocations,
   hydrateEarbudsFromStore, hydrateWatchFromStore, syncEarbudsState, syncWatchState,
 } from './types.ts';
 import type {
-  BleManagerSnapshot, BlePlxManagerLike, ConnectionMode, DeviceGeoPin, DiscoveredDevice,
+  BleManagerSnapshot, BlePlxManagerLike, DeviceGeoPin, DiscoveredDevice,
   EarbudsLiveState, PacketDirection, PacketLogEntry, PacketProtocol, WatchLiveState,
 } from './types.ts';
 import { LiveBleAdapter, clampInt } from './controllers/liveBleAdapter.ts';
+import { decodeStepInfo } from '../watch/protocol/timeAndActivity.ts';
+import {
+  JIELI_AUTH_OK, JIELI_AUTH_RESET_FLAG, isJieliAuthMessage, isJieliAuthOk, jieliAuthChallenge, jieliAuthResponse,
+} from '../audio/jieli/auth.ts';
 import { EarbudsController } from './controllers/earbudsController.ts';
 import type { EarbudsTransportHost } from './controllers/earbudsController.ts';
 import { WatchController } from './controllers/watchController.ts';
+import { ConnectionKeeper } from './controllers/connectionKeeper.ts';
+import type { KeptDeviceKind, KeeperStatus, ReconnectStrategy } from './controllers/connectionKeeper.ts';
 import type { WatchTransportHost } from './controllers/watchController.ts';
-import { SimBluetrumEarbuds } from './simulators/simBluetrumEarbuds.ts';
-import { SimJieliEarbuds } from './simulators/simJieliEarbuds.ts';
-import { SimCrrepaWatch } from './simulators/simCrrepaWatch.ts';
-import { buildFallbackEarbudsSpec, buildSimulatedDiscovery, resolveSimWatchFixture } from './simulators/simDiscovery.ts';
 
 const MAX_PACKET_LOGS = 250;
 
-/** Coordinates BLE discovery, GATT connections, simulators, protocol controllers, and offline persistence. */
+/** Coordinates live BLE discovery, GATT connections, protocol controllers, and offline persistence. */
 export class UltimaBleManager {
   private readonly store: OfflineStore;
   private readonly liveAdapter: LiveBleAdapter;
@@ -38,7 +40,6 @@ export class UltimaBleManager {
   private readonly listeners = new Set<(snapshot: BleManagerSnapshot) => void>();
 
   private initialized = false;
-  private mode: ConnectionMode = CONNECTION_MODE.SIMULATOR;
   private bleAvailable: boolean;
   private scanning = false;
   private lastError: string | null = null;
@@ -47,13 +48,58 @@ export class UltimaBleManager {
   private watch: WatchLiveState;
   private packetLogs: PacketLogEntry[] = [];
   private packetCounter = 0;
-  private simBluetrum: SimBluetrumEarbuds | null = null;
-  private simJieli: SimJieliEarbuds | null = null;
-  private simWatch: SimCrrepaWatch | null = null;
 
-  constructor(store?: OfflineStore, options?: { liveBleManager?: BlePlxManagerLike; liveGpsSyncTimeoutMs?: number }) {
+  private readonly ensurePermissions: () => Promise<boolean>;
+  private readonly keeper: ConnectionKeeper;
+
+  constructor(store?: OfflineStore, options?: {
+    liveBleManager?: BlePlxManagerLike;
+    liveGpsSyncTimeoutMs?: number;
+    /** Platform runtime-permission gate run before scan/connect (Android 12+ BLUETOOTH_SCAN/CONNECT). */
+    ensurePermissions?: () => Promise<boolean>;
+    /** 'retry' (Android, timed attempts + backoff) or 'pending' (iOS, OS-held connect without timeout). */
+    reconnectStrategy?: ReconnectStrategy;
+    keepAlivePingMs?: number;
+    /** iOS Core Bluetooth state-restoration key (see LiveBleAdapterOptions). */
+    restoreStateIdentifier?: string;
+    /**
+     * Phone-side "find my earbuds" sound. Ultima Link plays a looping tone at full
+     * media volume through the connected earbuds instead of a firmware command
+     * (Jieli earbuds ignore SearchDev). Returns false when the platform can't.
+     */
+    findSound?: { start(): boolean; stop(): void };
+  }) {
+    this.findSound = options?.findSound ?? null;
     this.store = store ?? new OfflineStore();
-    this.liveAdapter = new LiveBleAdapter(options?.liveBleManager);
+    this.ensurePermissions = options?.ensurePermissions ?? (async () => true);
+    this.liveAdapter = new LiveBleAdapter(
+      options?.liveBleManager,
+      options?.restoreStateIdentifier ? { restoreStateIdentifier: options.restoreStateIdentifier } : {},
+    );
+    this.keeper = new ConnectionKeeper(
+      {
+        getTargetId: (kind) => this.keepAliveTargetId(kind),
+        isConnected: (kind) => (kind === 'earbuds' ? this.earbuds.connected : this.watch.connected),
+        isConnecting: (kind) => (kind === 'earbuds' ? this.earbuds.connecting : this.watch.connecting),
+        reconnect: async (_kind, deviceId, persistent) => {
+          // Background attempts shouldn't overwrite the user-facing error banner.
+          const prevError = this.lastError;
+          try {
+            await this.connectInternal(deviceId, persistent);
+          } catch (err) {
+            this.lastError = prevError;
+            this.emit();
+            throw err;
+          }
+        },
+        ping: (kind) => (kind === 'earbuds' ? this.liveAdapter.pingEarbuds() : this.liveAdapter.pingWatch()),
+        onStatusChanged: () => this.emit(),
+      },
+      {
+        strategy: options?.reconnectStrategy ?? 'retry',
+        ...(options?.keepAlivePingMs !== undefined ? { pingIntervalMs: options.keepAlivePingMs } : {}),
+      },
+    );
     this.bleAvailable = this.liveAdapter.isAvailable();
     this.watchController = new WatchController(options?.liveGpsSyncTimeoutMs ?? 8000);
     this.earbuds = createEmptyEarbudsState();
@@ -70,43 +116,33 @@ export class UltimaBleManager {
 
   getSnapshot(): BleManagerSnapshot {
     return {
-      initialized: this.initialized, mode: this.mode, bleAvailable: this.bleAvailable,
+      initialized: this.initialized, bleAvailable: this.bleAvailable,
       scanning: this.scanning, lastError: this.lastError, discovered: [...this.discovered],
       earbuds: syncEarbudsState(this.earbuds), watch: syncWatchState(this.watch),
       packetLogs: [...this.packetLogs], storeState: this.store.getState(),
+      keepAlive: this.keeper.getStatus(),
     };
   }
+
+  /** Starts pinging live links and auto-reconnecting saved earbuds/watch. */
+  startKeepAlive(): void { this.keeper.start(); }
+  stopKeepAlive(): void { this.keeper.stop(); }
+  /** Re-run reconnect checks now (app foregrounded, Bluetooth turned back on…). */
+  pokeKeepAlive(): void { this.keeper.poke(); }
 
   subscribe(listener: (snapshot: BleManagerSnapshot) => void): () => void {
     this.listeners.add(listener);
     return () => { this.listeners.delete(listener); };
   }
 
-  setMode(mode: ConnectionMode): void {
-    if (this.mode === mode) return;
-    this.stopScan();
-    this.teardownConnectionsSync();
-    this.mode = mode;
-    this.discovered = [];
-    this.lastError = null;
-    this.emit();
-  }
-
   async startScan(): Promise<DiscoveredDevice[]> {
     this.stopScan();
     this.lastError = null;
+    await this.requirePermissions();
     this.discovered = [];
     this.scanning = true;
     this.emit();
 
-    if (this.mode === CONNECTION_MODE.SIMULATOR) {
-      const { devices, advPackets } = buildSimulatedDiscovery();
-      for (const p of advPackets) this.logPacket(PACKET_DIRECTION.RX, PACKET_PROTOCOL.ADV, p.deviceId, p.deviceName, p.rawAdv, p.summary);
-      this.discovered = devices;
-      this.scanning = false;
-      this.emit();
-      return [...devices];
-    }
     return this.liveAdapter.runScan({
       getDiscovered: () => this.discovered,
       onDevicesUpdated: (devices) => { this.discovered = devices; this.emit(); },
@@ -123,9 +159,29 @@ export class UltimaBleManager {
     if (wasScanning) this.emit();
   }
 
+  /**
+   * Connects earbuds already paired in the phone's Bluetooth settings. They often
+   * stop advertising once connected for audio, so they never show up in a scan.
+   */
+  async connectPairedEarbuds(address: string, name: string): Promise<void> {
+    if (!this.discovered.some((d) => d.id === address)) {
+      this.discovered = [...this.discovered, {
+        id: address, name, kind: DEVICE_KIND.EARBUDS, rssi: -60, protocol: PACKET_PROTOCOL.ADV,
+        mac: address, edrMac: address, offlineVerified: false, rawAdvHex: '',
+      }];
+    }
+    await this.connectDevice(address);
+  }
+
   async connectDevice(deviceId: string): Promise<void> {
+    const kind = await this.connectInternal(deviceId, false);
+    this.keeper.resume(kind);
+  }
+
+  private async connectInternal(deviceId: string, persistent: boolean): Promise<KeptDeviceKind> {
     this.stopScan();
     this.lastError = null;
+    await this.requirePermissions();
     const device = this.resolveDeviceForConnect(deviceId);
     if (!device) {
       const msg = `Device not found: ${deviceId}`;
@@ -134,27 +190,39 @@ export class UltimaBleManager {
       throw new Error(msg);
     }
     if (device.kind === DEVICE_KIND.EARBUDS) {
-      if (this.earbuds.connected && this.earbuds.deviceId !== device.id) await this.disconnectEarbuds();
-      await this.connectEarbudsDevice(device);
-      return;
+      if (this.earbuds.connected && this.earbuds.deviceId !== device.id) await this.teardownEarbuds();
+      await this.connectEarbudsDevice(device, persistent);
+      return 'earbuds';
     }
-    if (this.watch.connected && this.watch.deviceId !== device.id) await this.disconnectWatch();
-    await this.connectWatchDevice(device);
+    if (this.watch.connected && this.watch.deviceId !== device.id) await this.teardownWatch();
+    await this.connectWatchDevice(device, persistent);
+    return 'watch';
   }
 
+  /** User-initiated: also pauses auto-reconnect for earbuds until the next manual connect. */
   async disconnectEarbuds(): Promise<void> {
+    this.keeper.suppress('earbuds');
+    if (this.earbuds.connecting && this.earbuds.deviceId) await this.liveAdapter.cancelPendingConnect(this.earbuds.deviceId);
+    await this.teardownEarbuds();
+  }
+
+  /** User-initiated: also pauses auto-reconnect for the watch until the next manual connect. */
+  async disconnectWatch(): Promise<void> {
+    this.keeper.suppress('watch');
+    if (this.watch.connecting && this.watch.deviceId) await this.liveAdapter.cancelPendingConnect(this.watch.deviceId);
+    await this.teardownWatch();
+  }
+
+  private async teardownEarbuds(): Promise<void> {
     await this.liveAdapter.disconnectEarbuds();
     const prevLoc = this.earbuds.lastKnownLocation ?? this.store.getState().pairedDevices.find((d) => d.kind === DEVICE_KIND.EARBUDS)?.lastKnownLocation ?? null;
-    this.simBluetrum = null;
-    this.simJieli = null;
     this.earbudsController.resetReassembler();
     this.earbuds = syncEarbudsState({ ...createEmptyEarbudsState(), lastKnownLocation: prevLoc ? { ...prevLoc } : null });
     this.emit();
   }
 
-  async disconnectWatch(): Promise<void> {
+  private async teardownWatch(): Promise<void> {
     await this.liveAdapter.disconnectWatch();
-    this.simWatch = null;
     this.watchController.resetAll();
     const storeState = this.store.getState();
     const pairedWatch = storeState.pairedDevices.find((d) => d.id === this.watch.deviceId || d.kind === DEVICE_KIND.WATCH);
@@ -167,6 +235,70 @@ export class UltimaBleManager {
   }
 
   // Earbuds Controls
+  /** Pending Jieli challenge/response exchange (see `audio/jieli/auth.ts`). */
+  private jieliAuth: { challenge: Uint8Array; finish: (ok: boolean) => void } | null = null;
+
+  /**
+   * Jieli earbuds ignore every command until this two-way handshake passes,
+   * which is why battery, EQ and every other control stayed silent.
+   */
+  private authenticateJieli(timeoutMs = 3000, maxAttempts = 3): Promise<boolean> {
+    return new Promise<boolean>((resolve) => {
+      let attempts = 0;
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      let done = false;
+      const finish = (ok: boolean): void => {
+        if (done) return;
+        done = true;
+        if (timer !== null) clearTimeout(timer);
+        this.jieliAuth = null;
+        resolve(ok);
+      };
+      const start = async (): Promise<void> => {
+        if (done) return;
+        attempts += 1;
+        const challenge = jieliAuthChallenge();
+        this.jieliAuth = { challenge, finish };
+        try {
+          await this.sendJieliAuth(JIELI_AUTH_RESET_FLAG, 'Unlock: start');
+          await new Promise((r) => setTimeout(r, 50));
+          await this.sendJieliAuth(challenge, 'Unlock: challenge');
+        } catch {
+          finish(false);
+          return;
+        }
+        timer = setTimeout(() => { if (attempts < maxAttempts) void start(); else finish(false); }, timeoutMs);
+      };
+      void start();
+    });
+  }
+
+  private async sendJieliAuth(bytes: Uint8Array, summary: string): Promise<void> {
+    this.logPacket(PACKET_DIRECTION.TX, PACKET_PROTOCOL.JIELI, this.earbuds.deviceId ?? 'earbuds', this.earbuds.name, bytes, summary);
+    await this.liveAdapter.writeEarbudsBytes(DEVICE_CHIP.JL, bytes);
+  }
+
+  private handleJieliAuthMessage(bytes: Uint8Array): void {
+    const id = this.earbuds.deviceId ?? 'earbuds';
+    const pending = this.jieliAuth;
+    if (isJieliAuthOk(bytes)) {
+      this.logPacket(PACKET_DIRECTION.RX, PACKET_PROTOCOL.JIELI, id, this.earbuds.name, bytes, 'Unlock: accepted');
+      pending?.finish(true);
+      return;
+    }
+    if (bytes[0] === 0x01) {
+      // The earbuds' answer to our challenge. The official SDK checks it before saying "pass".
+      const expected = pending ? jieliAuthResponse(pending.challenge) : null;
+      const matches = !!expected && expected.every((b, i) => b === bytes[i]);
+      this.logPacket(PACKET_DIRECTION.RX, PACKET_PROTOCOL.JIELI, id, this.earbuds.name, bytes, matches ? 'Unlock: earbuds answered' : 'Unlock: unexpected answer');
+      void this.sendJieliAuth(JIELI_AUTH_OK, 'Unlock: answer OK').catch(() => pending?.finish(false));
+      return;
+    }
+    // 0x00 + 16 random bytes: the earbuds' challenge to us.
+    this.logPacket(PACKET_DIRECTION.RX, PACKET_PROTOCOL.JIELI, id, this.earbuds.name, bytes, 'Unlock: earbuds challenge');
+    void this.sendJieliAuth(jieliAuthResponse(bytes), 'Unlock: our answer').catch(() => pending?.finish(false));
+  }
+
   async refreshEarbudsInfo(): Promise<void> { await this.earbudsController.refreshInfo(this.createEarbudsHost(), this.requireEarbudsConnected()); }
   async setEarbudsAncMode(mode: 'off' | 'anc' | 'transparency'): Promise<void> { await this.runEarbudsAction((c) => this.earbudsController.setAncMode(this.createEarbudsHost(), c, mode), () => ({ ancMode: this.earbuds.ancMode })); }
   async setEarbudsAncGain(gain: number): Promise<void> { await this.runEarbudsAction((c) => this.earbudsController.setAncGain(this.createEarbudsHost(), c, gain), () => ({ ancGain: this.earbuds.ancGain })); }
@@ -205,7 +337,18 @@ export class UltimaBleManager {
     }
   }
 
-  async findEarbuds(enable: boolean): Promise<void> { await this.earbudsController.find(this.createEarbudsHost(), this.requireEarbudsConnected(), enable); }
+  private readonly findSound: { start(): boolean; stop(): void } | null;
+  async findEarbuds(enable: boolean): Promise<void> {
+    const chip = this.requireEarbudsConnected();
+    if (chip === DEVICE_CHIP.JL && this.findSound) {
+      if (enable && !this.findSound.start()) throw new Error('Couldn’t play the sound on this phone.');
+      if (!enable) this.findSound.stop();
+      this.earbuds = syncEarbudsState({ ...this.earbuds, finding: enable, findingActive: enable });
+      this.emit();
+      return;
+    }
+    await this.earbudsController.find(this.createEarbudsHost(), chip, enable);
+  }
 
   async pinLastKnownEarbudsLocation(note: string, lat?: number, lng?: number): Promise<void> {
     const { targetId, existingPaired } = await this.ensurePairedTarget(DEVICE_KIND.EARBUDS, 'No earbuds connected or paired to pin location');
@@ -241,26 +384,29 @@ export class UltimaBleManager {
     this.watch = syncWatchState({ ...this.watch, gpsRoutes: state.gpsRoutes });
     this.emit();
   }
+  /** Mirrors a phone-recorded workout on the watch so it measures heart rate and records the session too. */
+  async startWatchWorkout(type: number): Promise<void> { this.requireWatchConnected(); await this.watchController.training(this.createWatchHost(), { start: type }); }
+  async setWatchWorkoutState(state: 'pause' | 'resume' | 'stop'): Promise<void> { this.requireWatchConnected(); await this.watchController.training(this.createWatchHost(), state); }
   async measureWatchHeartRate(start: boolean): Promise<void> { this.requireWatchConnected(); await this.watchController.measureVital(this.createWatchHost(), 'hr', start); }
   async measureWatchSpO2(start: boolean): Promise<void> { this.requireWatchConnected(); await this.watchController.measureVital(this.createWatchHost(), 'spo2', start); }
   async measureWatchBloodPressure(start: boolean): Promise<void> { this.requireWatchConnected(); await this.watchController.measureVital(this.createWatchHost(), 'bp', start); }
   async queryWatchStress(): Promise<void> { this.requireWatchConnected(); await this.watchController.queryStress(this.createWatchHost()); }
-  async setWatchGoalSteps(steps: number): Promise<void> { const s = clampInt(steps, 1000, 100000); await this.runWatchSetting(encodeGoalSteps(s), `SetGoalSteps (${s})`, () => ({ goalSteps: this.watch.settings.goalSteps })); }
-  async setWatchTimeFormat(is24Hour: boolean): Promise<void> { await this.runWatchSetting(encodeTimeSystem(is24Hour), `SetTimeSystem (${is24Hour ? '24h' : '12h'})`, () => ({ is24Hour: this.watch.settings.is24Hour })); }
-  async setWatchQuickView(enabled: boolean): Promise<void> { await this.runWatchSetting(encodeQuickView(enabled), `SetQuickView (${enabled})`, () => ({ quickView: this.watch.settings.quickView })); }
-  async setWatchFace(faceId: number): Promise<void> { const f = clampInt(faceId, 0, 255); await this.runWatchSetting(encodeWatchFace(f), `SetWatchFace (${f})`, () => ({ watchFaceId: this.watch.settings.watchFaceId })); }
-  async setWatchUnits(imperial: boolean): Promise<void> { await this.runWatchSetting(encodeMetricSystem(imperial), `SetUnits (${imperial ? 'imperial' : 'metric'})`, () => ({ imperialUnits: this.watch.settings.imperialUnits })); }
-  async setWatchLanguage(languageId: number): Promise<void> { const l = clampInt(languageId, 0, 255); await this.runWatchSetting(encodeWatchLanguage(l), `SetWatchLanguage (${l})`, () => ({ languageId: this.watch.settings.languageId })); }
-  async setWatchSedentaryReminder(enabled: boolean): Promise<void> { await this.runWatchSetting(encodeSedentaryReminder(enabled), `SetSedentaryReminder (${enabled})`, () => ({ sedentaryReminder: this.watch.settings.sedentaryReminder })); }
+  async setWatchGoalSteps(steps: number): Promise<void> { const s = clampInt(steps, 1000, 100000); await this.runWatchSetting(encodeGoalSteps(s), `SetGoalSteps (${s})`, { goalSteps: s }); }
+  async setWatchTimeFormat(is24Hour: boolean): Promise<void> { await this.runWatchSetting(encodeTimeSystem(is24Hour), `SetTimeSystem (${is24Hour ? '24h' : '12h'})`, { is24Hour }); }
+  async setWatchQuickView(enabled: boolean): Promise<void> { await this.runWatchSetting(encodeQuickView(enabled), `SetQuickView (${enabled})`, { quickView: enabled }); }
+  async setWatchFace(faceId: number): Promise<void> { const f = clampInt(faceId, 0, 255); await this.runWatchSetting(encodeWatchFace(f), `SetWatchFace (${f})`, { watchFaceId: f }); }
+  async setWatchUnits(imperial: boolean): Promise<void> { await this.runWatchSetting(encodeMetricSystem(imperial), `SetUnits (${imperial ? 'imperial' : 'metric'})`, { imperialUnits: imperial }); }
+  async setWatchLanguage(languageId: number): Promise<void> { const l = clampInt(languageId, 0, 255); await this.runWatchSetting(encodeWatchLanguage(l), `SetWatchLanguage (${l})`, { languageId: l }); }
+  async setWatchSedentaryReminder(enabled: boolean): Promise<void> { await this.runWatchSetting(encodeSedentaryReminder(enabled), `SetSedentaryReminder (${enabled})`, { sedentaryReminder: enabled }); }
   async setWatchHrInterval(minutes: number): Promise<void> {
-    const units = minutes <= 0 ? 0 : Math.max(1, Math.round(Math.max(0, Math.trunc(minutes)) / 5));
-    await this.runWatchSetting(encodeTimingHeartRateInterval(units), `SetHrInterval (${units * 5}m)`, () => ({ hrIntervalMinutes: this.watch.settings.hrIntervalMinutes }));
+    const units = hrIntervalUnits(minutes);
+    await this.runWatchSetting(encodeTimingHeartRateInterval(units), `SetHrInterval (${units * 5}m)`, { hrIntervalMinutes: units * 5 });
   }
   async setWatchDrinkReminder(period: { enabled: boolean; startHour: number; startMinute: number; endHour: number; endMinute: number }): Promise<void> {
     const frame = buildCrpFrame(CRP_CMD.SET_DRINK_WATER_REMINDER, Uint8Array.of(
       period.enabled ? 1 : 0, clampInt(period.startHour, 0, 23), clampInt(period.startMinute, 0, 59), clampInt(period.endHour, 0, 23), clampInt(period.endMinute, 0, 59),
     ));
-    await this.runWatchSetting(frame, `SetDrinkReminder (${period.enabled ? 'on' : 'off'})`, () => ({ drinkReminderPeriod: { ...this.watch.settings.drinkReminderPeriod } }));
+    await this.runWatchSetting(frame, `SetDrinkReminder (${period.enabled ? 'on' : 'off'})`, { drinkReminderPeriod: { enabled: period.enabled, startHour: clampInt(period.startHour, 0, 23), startMinute: clampInt(period.startMinute, 0, 59), endHour: clampInt(period.endHour, 0, 23), endMinute: clampInt(period.endMinute, 0, 59) } });
   }
   async saveWatchAlarm(alarm: WatchAlarmRecord): Promise<void> { this.requireWatchConnected(); await this.watchController.saveAlarm(this.createWatchHost(), alarm); }
   async deleteWatchAlarm(id: number): Promise<void> { this.requireWatchConnected(); await this.watchController.deleteAlarm(this.createWatchHost(), id); }
@@ -285,32 +431,30 @@ export class UltimaBleManager {
     if (target === 'earbuds') {
       const chip = this.requireEarbudsConnected();
       this.logPacket(PACKET_DIRECTION.TX, chip === DEVICE_CHIP.BT ? PACKET_PROTOCOL.BLUETRUM : PACKET_PROTOCOL.JIELI, this.earbuds.deviceId ?? 'earbuds', this.earbuds.name, bytes, `Raw TX (${bytes.length} B)`);
-      if (this.mode === CONNECTION_MODE.SIMULATOR) {
-        const host = this.createEarbudsHost();
-        if (chip === DEVICE_CHIP.BT && this.simBluetrum) for (const rx of this.simBluetrum.receivePacket(bytes)) this.earbudsController.handleBluetrumRxBytes(host, rx);
-        else if (this.simJieli) for (const rx of this.simJieli.receivePacket(bytes)) this.earbudsController.handleJieliRxBytes(host, rx);
-      } else await this.liveAdapter.writeEarbudsBytes(chip, bytes);
+      await this.liveAdapter.writeEarbudsBytes(chip, bytes);
       return;
     }
     this.requireWatchConnected();
     this.logPacket(PACKET_DIRECTION.TX, PACKET_PROTOCOL.CRREPA, this.watch.deviceId ?? 'watch', this.watch.name, bytes, `Raw TX (${bytes.length} B)`);
-    if (this.mode === CONNECTION_MODE.SIMULATOR) {
-      const host = this.createWatchHost();
-      if (this.simWatch) for (const rx of this.simWatch.receivePacket(bytes)) await this.watchController.handleRxBytesAndFollowups(host, rx);
-    } else await this.liveAdapter.writeWatchBytes(bytes);
+    await this.liveAdapter.writeWatchBytes(bytes);
   }
 
   clearPacketLogs(): void { this.packetLogs = []; this.emit(); }
-  destroy(): void { this.stopScan(); this.teardownConnectionsSync(); this.liveAdapter.destroy(); }
+  destroy(): void { this.keeper.stop(); this.stopScan(); this.teardownConnectionsSync(); this.liveAdapter.destroy(); }
+
+  /** Device to keep connected: the active one, else the most recently connected saved device of that kind. */
+  private keepAliveTargetId(kind: KeptDeviceKind): string | null {
+    const active = kind === 'earbuds' ? this.earbuds.deviceId : this.watch.deviceId;
+    if (active) return active;
+    const saved = this.store.getState().pairedDevices
+      .filter((d) => d.kind === kind)
+      .sort((a, b) => (b.lastConnectedAt ?? 0) - (a.lastConnectedAt ?? 0));
+    return saved[0]?.id ?? null;
+  }
 
   private resolveDeviceForConnect(deviceId: string): DiscoveredDevice | undefined {
     const existing = this.discovered.find((d) => d.id === deviceId);
     if (existing) return existing;
-    if (this.mode === CONNECTION_MODE.SIMULATOR) {
-      const { devices } = buildSimulatedDiscovery();
-      const matched = devices.find((d) => d.id === deviceId);
-      if (matched) { this.discovered = devices; return matched; }
-    }
     const paired = this.store.getState().pairedDevices.find((d) => d.id === deviceId);
     if (!paired) return undefined;
     const isWatch = paired.kind === DEVICE_KIND.WATCH;
@@ -320,43 +464,58 @@ export class UltimaBleManager {
       ...(paired.mac !== undefined ? { mac: paired.mac, edrMac: paired.mac } : {}),
       ...(paired.chip !== undefined ? { chip: paired.chip } : {}),
       ...(paired.pid !== undefined ? { pid: paired.pid, productName: paired.name } : {}),
-      offlineVerified: true, rawAdvHex: '', isSimulated: this.mode === CONNECTION_MODE.SIMULATOR,
+      offlineVerified: true, rawAdvHex: '',
     };
   }
 
-  private async connectEarbudsDevice(device: DiscoveredDevice): Promise<void> {
-    const chip: DeviceChip = device.chip ?? device.product?.chip ?? (device.protocol === PACKET_PROTOCOL.BLUETRUM ? DEVICE_CHIP.BT : DEVICE_CHIP.JL);
+  private async connectEarbudsDevice(device: DiscoveredDevice, persistent = false): Promise<void> {
+    // Devices picked from Android's paired list carry no advertisement, so the chip is detected after connecting.
+    const chipHint: DeviceChip | null = device.chip ?? device.product?.chip ??
+      (device.protocol === PACKET_PROTOCOL.BLUETRUM ? DEVICE_CHIP.BT : device.protocol === PACKET_PROTOCOL.JIELI ? DEVICE_CHIP.JL : null);
+    let chip: DeviceChip = chipHint ?? DEVICE_CHIP.BT;
     const product = device.product ?? (device.pid !== undefined ? getProductById(device.pid) : undefined) ?? null;
     this.earbudsController.resetReassembler();
     const storeState = this.store.getState();
-    const persistedPrefs = storeState.earbudPrefs[device.id];
     const pairedRecord = storeState.pairedDevices.find((d) => d.id === device.id);
     this.earbuds = syncEarbudsState({
       ...createEmptyEarbudsState(), connecting: true, deviceId: device.id, name: device.name, deviceName: device.name,
       chip, pid: device.pid ?? product?.id ?? null, productId: device.pid ?? product?.id ?? 0, mac: device.mac ?? device.edrMac ?? null,
-      product, firmwareVersion: chip === DEVICE_CHIP.BT ? 'v1.0.24' : 'v2.1.4',
+      product, firmwareVersion: '',
       ...(pairedRecord?.lastKnownLocation ? { lastKnownLocation: { ...pairedRecord.lastKnownLocation } } : {}),
     });
     this.emit();
 
-    if (this.mode === CONNECTION_MODE.SIMULATOR) {
-      const spec = product ?? buildFallbackEarbudsSpec(device, chip);
-      if (chip === DEVICE_CHIP.BT) { this.simJieli = null; this.simBluetrum = new SimBluetrumEarbuds(spec, persistedPrefs); }
-      else { this.simBluetrum = null; this.simJieli = new SimJieliEarbuds(spec, persistedPrefs); }
-    } else {
-      const host = this.createEarbudsHost();
-      await this.liveAdapter.connectEarbuds(device.id, chip, {
-        onRxBytes: (b) => { if (chip === DEVICE_CHIP.BT) this.earbudsController.handleBluetrumRxBytes(host, b); else this.earbudsController.handleJieliRxBytes(host, b); },
-        onDisconnected: () => { this.earbuds = syncEarbudsState({ ...this.earbuds, connected: false, connecting: false }); this.emit(); },
+    const host = this.createEarbudsHost();
+    try {
+      chip = await this.liveAdapter.connectEarbuds(device.id, chipHint, {
+        onChipDetected: (detected) => { chip = detected; this.earbuds = syncEarbudsState({ ...this.earbuds, chip: detected }); },
+        onRxBytes: (b) => {
+          if (chip === DEVICE_CHIP.BT) { this.earbudsController.handleBluetrumRxBytes(host, b); return; }
+          if (isJieliAuthMessage(b)) { this.handleJieliAuthMessage(b); return; }
+          this.earbudsController.handleJieliRxBytes(host, b);
+        },
+        onDisconnected: () => { this.earbuds = syncEarbudsState({ ...this.earbuds, connected: false, connecting: false }); this.emit(); this.keeper.notifyUnexpectedDisconnect('earbuds'); },
         onError: (msg) => { this.bleAvailable = this.liveAdapter.isAvailable(); this.lastError = msg; this.emit(); },
-      });
+      }, persistent);
+    } catch (err) {
+      this.earbuds = syncEarbudsState({ ...this.earbuds, connected: false, connecting: false });
+      this.lastError = err instanceof Error ? err.message : String(err);
+      this.emit();
+      throw err;
     }
 
-    this.earbuds = syncEarbudsState({ ...this.earbuds, connected: true, connecting: false, lastSyncedAt: Date.now() });
+    this.earbuds = syncEarbudsState({ ...this.earbuds, chip, connected: true, connecting: false, lastSyncedAt: Date.now() });
     await this.store.upsertPairedDevice({
       id: device.id, name: this.earbuds.name, kind: DEVICE_KIND.EARBUDS, chip,
       ...(this.earbuds.pid !== null ? { pid: this.earbuds.pid } : {}), ...(this.earbuds.mac !== null ? { mac: this.earbuds.mac } : {}), lastConnectedAt: Date.now(),
     });
+    if (chip === DEVICE_CHIP.JL) {
+      const unlocked = await this.authenticateJieli();
+      if (!unlocked) {
+        this.lastError = 'The earbuds didn’t accept the app. Battery and controls may not update — reconnect to try again.';
+        this.emit();
+      }
+    }
     await this.refreshEarbudsInfo();
     if (this.earbuds.deviceId) {
       await this.store.updateEarbudPrefs(this.earbuds.deviceId, {
@@ -369,9 +528,8 @@ export class UltimaBleManager {
     this.emit();
   }
 
-  private async connectWatchDevice(device: DiscoveredDevice): Promise<void> {
+  private async connectWatchDevice(device: DiscoveredDevice, persistent = false): Promise<void> {
     const storeState = this.store.getState();
-    const hasPairedWatch = storeState.pairedDevices.some((d) => d.kind === DEVICE_KIND.WATCH);
     const pairedWatchRecord = storeState.pairedDevices.find((d) => d.id === device.id);
     this.watchController.resetForConnect();
     this.watch = syncWatchState({
@@ -384,18 +542,26 @@ export class UltimaBleManager {
     });
     this.emit();
 
-    if (this.mode === CONNECTION_MODE.SIMULATOR) {
-      const fixture = resolveSimWatchFixture(device.id);
-      this.simWatch = new SimCrrepaWatch(fixture, storeState.watchSettings, storeState.watchAlarms, hasPairedWatch);
-      this.watch = syncWatchState({ ...this.watch, batteryPercent: fixture.batteryPercent, firmwareVersion: fixture.firmwareVersion, firmwareType: this.watch.firmwareType || fixture.firmwareType });
-    } else {
-      const host = this.createWatchHost();
+    const liveHost = this.createWatchHost();
+    try {
       await this.liveAdapter.connectWatch(device.id, {
-        onCrrepaRxBytes: (b) => { void this.watchController.handleRxBytesAndFollowups(host, b).catch(() => undefined); },
+        onCrrepaRxBytes: (b) => { void this.watchController.handleRxBytesAndFollowups(liveHost, b).catch(() => undefined); },
         onBatteryPercent: (percent) => { this.watch = syncWatchState({ ...this.watch, batteryPercent: percent }); this.emit(); },
-        onDisconnected: () => { this.watchController.resetForLiveDisconnect(); this.watch = syncWatchState({ ...this.watch, connected: false, connecting: false, gpsSyncing: false }); this.emit(); },
+        onStepBytes: (bytes) => {
+          const info = decodeStepInfo(bytes);
+          if (!info) return;
+          this.watch = syncWatchState({ ...this.watch, steps: info.steps, distanceMeters: info.distanceMeters, caloriesKcal: info.caloriesKcal, lastSyncedAt: Date.now() });
+          this.emit();
+        },
+        onFirmwareRevision: (revision) => { this.watch = syncWatchState({ ...this.watch, firmwareVersion: revision }); this.emit(); },
+        onDisconnected: () => { this.watchController.resetForLiveDisconnect(); this.watch = syncWatchState({ ...this.watch, connected: false, connecting: false, gpsSyncing: false }); this.emit(); this.keeper.notifyUnexpectedDisconnect('watch'); },
         onError: (msg) => { this.bleAvailable = this.liveAdapter.isAvailable(); this.lastError = msg; this.emit(); },
-      });
+      }, persistent);
+    } catch (err) {
+      this.watch = syncWatchState({ ...this.watch, connected: false, connecting: false });
+      this.lastError = err instanceof Error ? err.message : String(err);
+      this.emit();
+      throw err;
     }
 
     this.watch = syncWatchState({ ...this.watch, connected: true, connecting: false, lastSyncedAt: Date.now() });
@@ -431,11 +597,28 @@ export class UltimaBleManager {
     this.emit();
   }
 
-  private async runWatchSetting(frame: Uint8Array, summary: string, pickPatch: () => WatchSettingsPatch): Promise<void> {
+  /**
+   * Sends a setting and applies it locally. Real watches don't echo SET commands,
+   * so the new value is stored as soon as the write succeeds (a later query reply
+   * from the watch still overrides it).
+   */
+  private async runWatchSetting(frame: Uint8Array, summary: string, patch: WatchSettingsPatch): Promise<void> {
     this.requireWatchConnected();
     await this.watchController.sendFrame(this.createWatchHost(), frame, summary);
-    await this.store.updateWatchSettings(pickPatch());
+    this.watch = syncWatchState({ ...this.watch, settings: { ...this.watch.settings, ...patch } as WatchLiveState['settings'] });
+    await this.store.updateWatchSettings(patch);
     this.emit();
+  }
+
+  private async requirePermissions(): Promise<void> {
+    let granted = false;
+    try { granted = await this.ensurePermissions(); } catch { granted = false; }
+    if (!granted) {
+      const msg = 'Bluetooth permission denied. Allow Nearby devices (and Location) for Ultima Open in system settings.';
+      this.lastError = msg;
+      this.emit();
+      throw new Error(msg);
+    }
   }
 
   private requireEarbudsConnected(): DeviceChip {
@@ -447,9 +630,7 @@ export class UltimaBleManager {
   }
   private createEarbudsHost(): EarbudsTransportHost {
     return {
-      getState: () => this.earbuds, setState: (next) => { this.earbuds = next; }, isSimulator: () => this.mode === CONNECTION_MODE.SIMULATOR,
-      sendSimulatorBluetrum: (f) => (this.simBluetrum ? this.simBluetrum.receivePacket(f) : []),
-      sendSimulatorJieli: (p) => (this.simJieli ? this.simJieli.receivePacket(p) : []),
+      getState: () => this.earbuds, setState: (next) => { this.earbuds = next; },
       writeLiveBytes: (chip, bytes) => this.liveAdapter.writeEarbudsBytes(chip, bytes),
       logPacket: (dir, proto, id, name, b, sum, cmd) => this.logPacket(dir, proto, id, name, b, sum, cmd),
       setError: (msg) => { this.lastError = msg; }, emit: () => this.emit(),
@@ -458,8 +639,6 @@ export class UltimaBleManager {
   private createWatchHost(): WatchTransportHost {
     return {
       getState: () => this.watch, setState: (next) => { this.watch = next; },
-      isSimulator: () => this.mode === CONNECTION_MODE.SIMULATOR, isLiveBle: () => this.mode === CONNECTION_MODE.LIVE_BLE,
-      sendSimulatorWatch: (f) => (this.simWatch ? this.simWatch.receivePacket(f) : []),
       writeLiveBytes: (bytes) => this.liveAdapter.writeWatchBytes(bytes),
       logPacket: (dir, proto, id, name, b, sum, cmd) => this.logPacket(dir, proto, id, name, b, sum, cmd),
       getStore: () => this.store, emit: () => this.emit(),
@@ -480,7 +659,6 @@ export class UltimaBleManager {
   }
   private teardownConnectionsSync(): void {
     this.liveAdapter.teardownConnectionsSync();
-    this.simBluetrum = null; this.simJieli = null; this.simWatch = null;
     this.earbudsController.resetReassembler(); this.watchController.resetAll();
     this.earbuds = syncEarbudsState(createEmptyEarbudsState());
     this.watch = syncWatchState(createEmptyWatchState(this.watch.settings));
@@ -492,3 +670,13 @@ export class UltimaBleManager {
   }
 }
 export { EQ_FREQUENCIES };
+
+/** Timing heart-rate values the watch accepts, in 5-minute units (official app: 5/10/20/30 min). */
+export const WATCH_HR_INTERVAL_MINUTES = [5, 10, 20, 30] as const;
+
+/** Maps minutes to the nearest supported 5-minute unit (1, 2, 4 or 6); 0 = off. */
+export function hrIntervalUnits(minutes: number): number {
+  if (!(minutes > 0)) return 0;
+  const nearest = WATCH_HR_INTERVAL_MINUTES.reduce((best, m) => (Math.abs(m - minutes) < Math.abs(best - minutes) ? m : best));
+  return nearest / 5;
+}

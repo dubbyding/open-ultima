@@ -7,13 +7,24 @@ import { PACKET_PROTOCOL } from '../types.ts';
 import type { BlePlxDeviceLike, BlePlxManagerLike, BlePlxSubscriptionLike, DiscoveredDevice } from '../types.ts';
 
 const LIVE_SCAN_DURATION_MS = 3500;
+/** Direct (non-autoConnect) GATT connect timeout so reconnect attempts fail fast when out of range. */
+const CONNECT_TIMEOUT_MS = 12000;
 const BASE64_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
 
 interface BlePlxModuleLike {
-  BleManager: new () => BlePlxManagerLike;
+  BleManager: new (options?: Record<string, unknown>) => BlePlxManagerLike;
 }
 
-/** Lazily loads `react-native-ble-plx` so Node 24 tests and simulators run without native binaries. */
+export interface LiveBleAdapterOptions {
+  /**
+   * iOS Core Bluetooth state-restoration key. With the `bluetooth-central`
+   * background mode, iOS relaunches the app for BLE events (e.g. a pending
+   * reconnect completing) even after it was suspended or terminated.
+   */
+  restoreStateIdentifier?: string;
+}
+
+/** Lazily loads `react-native-ble-plx` so Node tests can run without native binaries. */
 export function loadBlePlxModule(): BlePlxModuleLike | null {
   const mod: unknown = typeof require === 'function' ? (() => {
     try { return require('react-native-ble-plx'); } catch { return null; }
@@ -119,7 +130,7 @@ export function parseLiveBleDevice(raw: BlePlxDeviceLike): DiscoveredDevice | nu
             mac: advInfo.edrMac, edrMac: advInfo.edrMac, chip, pid: advInfo.pid, productName: name,
             bid: advInfo.bid, product: advInfo.product, edrConnected: advInfo.edrConnected,
             license: advInfo.license, offlineVerified: advInfo.offlineVerified, advInfo,
-            rawAdvHex: bytesToHex(mfgBytes, ' '), isSimulated: false,
+            rawAdvHex: bytesToHex(mfgBytes, ' '),
           };
         }
       }
@@ -147,7 +158,7 @@ export function parseLiveBleDevice(raw: BlePlxDeviceLike): DiscoveredDevice | nu
               crpScanInfo: crp, firmwareType: crp.firmwareType, crpFirmware: crp.firmwareType,
               platform: crp.platform, crpPlatform: crp.platform, chipId: crp.chipId,
               crpChipId: crp.chipId, functionMask: crp.functionMask, crpFunctionMask: crp.functionMask,
-              rawAdvHex: bytesToHex(scanRecord, ' '), isSimulated: false,
+              rawAdvHex: bytesToHex(scanRecord, ' '),
             };
           }
         }
@@ -160,7 +171,7 @@ export function parseLiveBleDevice(raw: BlePlxDeviceLike): DiscoveredDevice | nu
     return {
       id: raw.id, name: rawName || 'ULTIMA Fit Watch', kind: DEVICE_KIND.WATCH,
       rssi: raw.rssi ?? -68, protocol: PACKET_PROTOCOL.CRREPA, offlineVerified: false,
-      rawAdvHex: '', isSimulated: false,
+      rawAdvHex: '',
     };
   }
   if (
@@ -173,7 +184,7 @@ export function parseLiveBleDevice(raw: BlePlxDeviceLike): DiscoveredDevice | nu
       kind: DEVICE_KIND.EARBUDS, rssi: raw.rssi ?? -68,
       protocol: isBt ? PACKET_PROTOCOL.BLUETRUM : PACKET_PROTOCOL.JIELI,
       chip: isBt ? DEVICE_CHIP.BT : DEVICE_CHIP.JL, offlineVerified: false,
-      rawAdvHex: '', isSimulated: false,
+      rawAdvHex: '',
     };
   }
   return null;
@@ -189,6 +200,20 @@ export interface LiveScanCallbacks {
 
 export class LiveBleAdapter {
   private manager: BlePlxManagerLike | null = null;
+  /**
+   * ble-plx numbers monitor transactions "1", "2", … per JS instance, but native
+   * monitors survive a JS reload / manager re-creation and keep emitting with the
+   * old ids — which then match new listeners (duplicated packets, watch frames in
+   * the earbuds handler). A per-session prefix keeps every id unique.
+   */
+  private readonly txSession = Math.random().toString(36).slice(2, 8);
+  private txCounter = 0;
+  private nextTxId(tag: string): string {
+    this.txCounter += 1;
+    return `ultima-${this.txSession}-${tag}-${this.txCounter}`;
+  }
+  /** Set once the earbuds rejected a write-with-response, so later writes skip straight to without-response. */
+  private earbudsWriteNoResponse = false;
   private bleAvailable: boolean;
   private scanTimer: ReturnType<typeof setTimeout> | null = null;
   private scanResolver: ((devices: DiscoveredDevice[]) => void) | null = null;
@@ -197,7 +222,10 @@ export class LiveBleAdapter {
   private earbudsSubs: BlePlxSubscriptionLike[] = [];
   private watchSubs: BlePlxSubscriptionLike[] = [];
 
-  constructor(injectedManager?: BlePlxManagerLike) {
+  private readonly options: LiveBleAdapterOptions;
+
+  constructor(injectedManager?: BlePlxManagerLike, options: LiveBleAdapterOptions = {}) {
+    this.options = options;
     if (injectedManager) {
       this.manager = injectedManager;
       this.bleAvailable = true;
@@ -220,7 +248,13 @@ export class LiveBleAdapter {
       throw new Error(msg);
     }
     try {
-      const instance = new mod.BleManager();
+      const instance = this.options.restoreStateIdentifier
+        ? new mod.BleManager({
+            restoreStateIdentifier: this.options.restoreStateIdentifier,
+            // Restored peripherals are re-acquired by the keep-alive reconnect pass.
+            restoreStateFunction: () => undefined,
+          })
+        : new mod.BleManager();
       this.manager = instance;
       this.bleAvailable = true;
       return instance;
@@ -233,7 +267,24 @@ export class LiveBleAdapter {
     }
   }
 
-  runScan(callbacks: LiveScanCallbacks): Promise<DiscoveredDevice[]> {
+  /** Rejects with a readable message when the phone's Bluetooth radio is off or unauthorized. */
+  async assertPoweredOn(onError?: (message: string) => void): Promise<void> {
+    const manager = this.ensureManager(onError);
+    if (typeof manager.state !== 'function') return;
+    let state = 'Unknown';
+    try { state = await manager.state(); } catch { return; }
+    if (state === 'PoweredOn' || state === 'Unknown' || state === 'Resetting') return;
+    const msg = state === 'PoweredOff'
+      ? 'Bluetooth is turned off. Turn it on and try again.'
+      : state === 'Unauthorized'
+        ? 'Bluetooth access is not authorized for Ultima Open.'
+        : `Bluetooth unavailable (${state}).`;
+    onError?.(msg);
+    throw new Error(msg);
+  }
+
+  async runScan(callbacks: LiveScanCallbacks): Promise<DiscoveredDevice[]> {
+    await this.assertPoweredOn(callbacks.onError);
     const manager = this.ensureManager(callbacks.onError);
     const seen = new Map<string, DiscoveredDevice>();
 
@@ -325,9 +376,11 @@ export class LiveBleAdapter {
     deviceId: string,
     mtu: number,
     onError: (message: string) => void,
+    persistent = false,
   ): Promise<BlePlxDeviceLike> {
     const manager = this.ensureManager(onError);
-    const connected = await manager.connectToDevice(deviceId);
+    // Persistent (iOS): no timeout — the OS keeps the request pending until the device is in range.
+    const connected = await manager.connectToDevice(deviceId, persistent ? {} : { timeout: CONNECT_TIMEOUT_MS });
     await connected.discoverAllServicesAndCharacteristics();
     if (typeof connected.requestMTU === 'function') {
       try {
@@ -341,15 +394,29 @@ export class LiveBleAdapter {
 
   async connectEarbuds(
     deviceId: string,
-    chip: DeviceChip,
+    /** null = unknown (e.g. connecting to an already-paired device without a scan): detected from GATT services. */
+    chipHint: DeviceChip | null,
     callbacks: {
       onRxBytes: (bytes: Uint8Array) => void;
       onDisconnected: () => void;
       onError: (message: string) => void;
+      /** Called before notifications start when the chip had to be detected. */
+      onChipDetected?: (chip: DeviceChip) => void;
     },
-  ): Promise<void> {
-    const connected = await this.connectAndDiscover(deviceId, 128, callbacks.onError);
+    persistent = false,
+  ): Promise<DeviceChip> {
+    const connected = await this.connectAndDiscover(deviceId, 128, callbacks.onError, persistent);
+    let chip = chipHint;
+    if (chip === null) {
+      chip = await detectEarbudsChip(connected);
+      if (chip === null) {
+        await this.manager?.cancelDeviceConnection?.(deviceId).catch(() => undefined);
+        throw new Error('These earbuds don’t support app controls. They still work for music and calls.');
+      }
+      callbacks.onChipDetected?.(chip);
+    }
     this.earbudsDevice = connected;
+    this.earbudsWriteNoResponse = false;
     this.clearEarbudsSubs();
 
     const notifyService = chip === DEVICE_CHIP.BT ? BLUETRUM_UUIDS.SERVICE : JIELI_UUIDS.SERVICE;
@@ -357,13 +424,14 @@ export class LiveBleAdapter {
     const sub = connected.monitorCharacteristicForService(notifyService, notifyChar, (error, char) => {
       if (error || !char?.value) return;
       callbacks.onRxBytes(base64ToBytes(char.value));
-    });
+    }, this.nextTxId('earbuds'));
     const disconnSub = connected.onDisconnected(() => {
       this.clearEarbudsSubs();
       this.earbudsDevice = null;
       callbacks.onDisconnected();
     });
     this.earbudsSubs = [sub, disconnSub];
+    return chip;
   }
 
   async connectWatch(
@@ -371,22 +439,53 @@ export class LiveBleAdapter {
     callbacks: {
       onCrrepaRxBytes: (bytes: Uint8Array) => void;
       onBatteryPercent: (percent: number) => void;
+      /** Raw (unframed) live step/distance/calorie record from the FEE1 step characteristic. */
+      onStepBytes?: (bytes: Uint8Array) => void;
+      /** Firmware revision string from the standard Device Information service. */
+      onFirmwareRevision?: (revision: string) => void;
       onDisconnected: () => void;
       onError: (message: string) => void;
     },
+    persistent = false,
   ): Promise<void> {
-    const connected = await this.connectAndDiscover(deviceId, 247, callbacks.onError);
+    const connected = await this.connectAndDiscover(deviceId, 247, callbacks.onError, persistent);
     this.watchDevice = connected;
     this.clearWatchSubs();
 
     const subs: BlePlxSubscriptionLike[] = [];
-    for (const charUuid of [CRREPA_UUIDS.FEE1, CRREPA_UUIDS.FEE3, CRREPA_UUIDS.FEE6]) {
+    // FEE1 carries live step totals as a raw record (not a 0xFE 0xEA frame).
+    try {
+      subs.push(
+        connected.monitorCharacteristicForService(CRREPA_UUIDS.SERVICE, CRREPA_UUIDS.FEE1, (error, char) => {
+          if (error || !char?.value) return;
+          const bytes = base64ToBytes(char.value);
+          if (bytes[0] === 0xfe && bytes[1] === 0xea) callbacks.onCrrepaRxBytes(bytes);
+          else callbacks.onStepBytes?.(bytes);
+        }, this.nextTxId('watch-steps')),
+      );
+    } catch {
+      // Step characteristic is optional on some variants.
+    }
+    if (connected.readCharacteristicForService) {
+      void connected.readCharacteristicForService(CRREPA_UUIDS.SERVICE, CRREPA_UUIDS.FEE1)
+        .then((char) => { if (char?.value) callbacks.onStepBytes?.(base64ToBytes(char.value)); })
+        .catch(() => undefined);
+      void connected.readCharacteristicForService(CRREPA_UUIDS.DEVICE_INFO_SERVICE, CRREPA_UUIDS.FIRMWARE_REVISION)
+        .then((char) => {
+          if (!char?.value) return;
+          const text = printableAscii(base64ToBytes(char.value));
+          if (text) callbacks.onFirmwareRevision?.(text);
+        })
+        .catch(() => undefined);
+    }
+
+    for (const charUuid of [CRREPA_UUIDS.FEE3, CRREPA_UUIDS.FEE6]) {
       try {
         subs.push(
           connected.monitorCharacteristicForService(CRREPA_UUIDS.SERVICE, charUuid, (error, char) => {
             if (error || !char?.value) return;
             callbacks.onCrrepaRxBytes(base64ToBytes(char.value));
-          }),
+          }, this.nextTxId('watch-rx')),
         );
       } catch {
         // Not all watch variants expose every auxiliary notify characteristic.
@@ -403,6 +502,7 @@ export class LiveBleAdapter {
             const bytes = base64ToBytes(char.value);
             if (bytes.length > 0) callbacks.onBatteryPercent(clampInt(bytes[0]!, 0, 100));
           },
+          this.nextTxId('watch-battery'),
         ),
       );
     } catch {
@@ -419,11 +519,32 @@ export class LiveBleAdapter {
     this.watchSubs = subs;
   }
 
+  /** Keep-alive ping: reads RSSI over the live link. Returns dBm, or null if the device can't report it. Throws if the link is dead. */
+  async pingEarbuds(): Promise<number | null> {
+    return pingDevice(this.earbudsDevice, 'earbuds');
+  }
+
+  async pingWatch(): Promise<number | null> {
+    return pingDevice(this.watchDevice, 'watch');
+  }
+
   async writeEarbudsBytes(chip: DeviceChip, bytes: Uint8Array): Promise<void> {
     if (!this.earbudsDevice) throw new Error('Live earbuds GATT device is not connected');
     const serviceUuid = chip === DEVICE_CHIP.BT ? BLUETRUM_UUIDS.SERVICE : JIELI_UUIDS.SERVICE;
     const charUuid = chip === DEVICE_CHIP.BT ? BLUETRUM_UUIDS.NOTIFY_WRITE : JIELI_UUIDS.WRITE;
-    await this.earbudsDevice.writeCharacteristicWithResponseForService(serviceUuid, charUuid, bytesToBase64(bytes));
+    const b64 = bytesToBase64(bytes);
+    // Jieli's AE01 is usually write-without-response only; fall back so writes aren't silently rejected.
+    if (this.earbudsWriteNoResponse) {
+      await this.earbudsDevice.writeCharacteristicWithoutResponseForService(serviceUuid, charUuid, b64);
+      return;
+    }
+    try {
+      await this.earbudsDevice.writeCharacteristicWithResponseForService(serviceUuid, charUuid, b64);
+    } catch (err) {
+      await this.earbudsDevice.writeCharacteristicWithoutResponseForService(serviceUuid, charUuid, b64);
+      this.earbudsWriteNoResponse = true;
+      void err;
+    }
   }
 
   async writeWatchBytes(bytes: Uint8Array): Promise<void> {
@@ -434,6 +555,12 @@ export class LiveBleAdapter {
     } catch {
       await this.watchDevice.writeCharacteristicWithResponseForService(CRREPA_UUIDS.SERVICE, CRREPA_UUIDS.FEE1, b64);
     }
+  }
+
+  /** Aborts a connect that hasn't completed yet (e.g. an iOS pending reconnect). */
+  async cancelPendingConnect(deviceId: string): Promise<void> {
+    if (!this.manager || typeof this.manager.cancelDeviceConnection !== 'function') return;
+    try { await this.manager.cancelDeviceConnection(deviceId); } catch { /* nothing pending */ }
   }
 
   async disconnectEarbuds(): Promise<void> {
@@ -480,6 +607,13 @@ export class LiveBleAdapter {
   }
 }
 
+async function pingDevice(device: BlePlxDeviceLike | null, label: string): Promise<number | null> {
+  if (!device) throw new Error(`Live ${label} GATT device is not connected`);
+  if (typeof device.readRSSI !== 'function') return null;
+  const updated = await device.readRSSI();
+  return typeof updated?.rssi === 'number' ? updated.rssi : null;
+}
+
 function clearSubsList(subs: BlePlxSubscriptionLike[]): BlePlxSubscriptionLike[] {
   for (const sub of subs) {
     try { sub.remove(); } catch { /* ignore */ }
@@ -491,5 +625,26 @@ async function cancelDeviceSafe(device: BlePlxDeviceLike | null): Promise<null> 
   if (device) {
     try { await device.cancelConnection(); } catch { /* ignore */ }
   }
+  return null;
+}
+
+/** Decodes bytes as ASCII and returns it only if it's a readable string (no control bytes). */
+export function printableAscii(bytes: Uint8Array): string | null {
+  let out = '';
+  for (const b of bytes) {
+    if (b === 0) break;
+    if (b < 0x20 || b > 0x7e) return null;
+    out += String.fromCharCode(b);
+  }
+  const t = out.trim();
+  return t.length > 0 ? t : null;
+}
+
+/** Picks the earbuds control protocol from the GATT services a connected device exposes. */
+async function detectEarbudsChip(device: BlePlxDeviceLike): Promise<DeviceChip | null> {
+  if (typeof device.services !== 'function') return null;
+  const uuids = (await device.services().catch(() => [])).map((s) => s.uuid.toLowerCase());
+  if (uuids.includes(BLUETRUM_UUIDS.SERVICE.toLowerCase())) return DEVICE_CHIP.BT;
+  if (uuids.includes(JIELI_UUIDS.SERVICE.toLowerCase())) return DEVICE_CHIP.JL;
   return null;
 }

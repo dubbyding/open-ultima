@@ -1,0 +1,23 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+  <!-- Granted through the watch companion association (CompanionDeviceManager, watch profile). -->
+  <uses-permission android:name="android.permission.MANAGE_ONGOING_CALLS" />
+  <uses-permission android:name="android.permission.CALL_COMPANION_APP" />
+  <uses-permission android:name="android.permission.REQUEST_COMPANION_PROFILE_WATCH" />
+  <uses-feature android:name="android.software.companion_device_setup" android:required="false" />
+
+  <application>
+    <!--
+      Non-UI in-call service. Telecom binds it during calls once the app is a
+      companion of the user's watch. It only moves call audio to the device the
+      user picked; it never shows UI, rings, or answers.
+    -->
+    <service
+      android:name="expo.modules.ultimacalls.CallAudioRouterService"
+      android:permission="android.permission.BIND_INCALL_SERVICE"
+      android:exported="true">
+      <intent-filter>
+        <action android:name="android.telecom.InCallService" />
+      </intent-filter>
+    </service>
+  </application>
+</manifest>

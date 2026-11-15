@@ -1,17 +1,20 @@
-export { CONNECTION_MODE, EQ_FREQUENCIES, PACKET_DIRECTION, PACKET_PROTOCOL, UltimaBleManager } from '../domains/bluetooth/index.ts';
+export { EQ_FREQUENCIES, PACKET_DIRECTION, PACKET_PROTOCOL, UltimaBleManager } from '../domains/bluetooth/index.ts';
 export type {
   BleManagerSnapshot,
   BlePlxCharacteristicLike,
   BlePlxDeviceLike,
   BlePlxManagerLike,
   BlePlxSubscriptionLike,
-  ConnectionMode,
   DeviceGeoPin,
   DiscoveredDevice,
   EarbudSideLocations,
   EarbudsBatteryState,
   EarbudsLiveKeyMappings,
   EarbudsLiveState,
+  KeeperLinkState,
+  KeeperLinkStatus,
+  KeeperStatus,
+  KeptDeviceKind,
   PacketDirection,
   PacketLogEntry,
   PacketProtocol,
