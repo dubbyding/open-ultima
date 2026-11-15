@@ -189,10 +189,10 @@ Byte 5..: payload bytes
 | `0x3D` | `dl8` | 24h Continuous BP | Pairs of `[sbp, dbp]` slots |
 | `0x41` | `r48` | Push Notification Message | `[messageType (0x00..0x83: Call, SMS, WhatsApp, Instagram, Gmail, etc.), ...UTF-8 emoji-filtered text]` |
 | `0x61` | `qm8` | Find Watch | Empty payload -> watch vibrates/rings |
-| `0x68` | `nl8` | Single HR Measure | `[0x00]` start / `[0xFF]` stop; Response byte 0 = BPM |
+| `0x68` | `ol8.a(Z)` | Dynamic HR / training mode (`startMeasureDynamicRate`) — starts a workout on the watch | `[0x00]` start / `[0xFF]` stop |
 | `0x69` | `dl8` | Blood Pressure Measure | `[0, 0, 0]` start / `[0xFF, 0xFF, 0xFF]` stop; Response `[0, sbp, dbp]` |
 | `0x6B` | `oi8` | Single SpO2 Measure | `[0x00]` start / `[0xFF]` stop; Response byte 0 = SpO2 % |
-| `0x6D` | `nl8` | Dynamic Live HR | `[0x00]` start / `[0xFF]` stop |
+| `0x6D` | `ol8.b(Z)` | Single HR Measure (`startMeasureOnceHeartRate`) | `[0x00]` start / `[0xFF]` stop; Response byte 0 = BPM |
 | `0x72` | `jg8` | Drink Water / DND Period | `[startHour, startMin, endHour, endMin]` |
 | `0x7E` | `oi8`/`dl8` | Timing SpO2 / Cont. Measure | `[subCmd, enable, ...]` |
 | `0xB6` | `sd8` | Steps Category & Workout HR | 48 half-hour slots (`96` bytes, 2B BE per slot) & workout HR logs |
