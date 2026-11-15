@@ -9,13 +9,15 @@ import {
   encodeQueryGpsLiveLocation, encodeQueryGpsPath, encodeQueryMovementWorkouts,
   encodeQueryNewAlarms, encodeQueryTimingStress, encodeQueryTodayHeartRate,
   encodeSyncNapSleep, encodeSyncStepCategory, encodeSyncStepsAndSleep, encodeTimeSync, parseCrpFrame,
+  decodeTrainingNotification, encodeTrainingStart, encodeTrainingState,
 } from '../../../protocols/ultimaFitCrrepa.ts';
-import type { CrpMovementWorkoutRecord, CrpSleepInfo } from '../../../protocols/ultimaFitCrrepa.ts';
-import type { DailyHealthRecordInput, GpsWaypoint, GpsWorkoutRoute, OfflineStore, WatchAlarmRecord, WatchSettings } from '../../../storage/offlineStore.ts';
+import type { CrpMovementWorkoutRecord, CrpSleepInfo, CrpSleepSegment } from '../../../protocols/ultimaFitCrrepa.ts';
+import { CRP_SLEEP_STATE } from '../../../protocols/ultimaFitCrrepa.ts';
+import type { DailyHealthRecordInput, GpsWaypoint, GpsWorkoutRoute, OfflineStore, SleepSegmentRecord, SleepStageName, WatchAlarmRecord, WatchSettings } from '../../../storage/offlineStore.ts';
 import { isValidGpsCoordinate, totalPathDistanceMeters } from '../../../utils/geoMath.ts';
 import { PACKET_DIRECTION, PACKET_PROTOCOL, syncWatchState } from '../types.ts';
 import type { Mutable, PacketDirection, PacketProtocol, WatchLiveState } from '../types.ts';
-import { clampInt, decodeUtf8 } from './liveBleAdapter.ts';
+import { clampInt, printableAscii } from './liveBleAdapter.ts';
 
 export interface PendingCrpFollowup { frame: Uint8Array; summary: string; }
 export interface PendingGpsRouteBuffer { startedAt: Date; waypoints: GpsWaypoint[]; completed: boolean; persisted: boolean; }
@@ -23,9 +25,6 @@ export interface PendingGpsRouteBuffer { startedAt: Date; waypoints: GpsWaypoint
 export interface WatchTransportHost {
   getState(): WatchLiveState;
   setState(next: WatchLiveState): void;
-  isSimulator(): boolean;
-  isLiveBle(): boolean;
-  sendSimulatorWatch(frame: Uint8Array): Uint8Array[];
   writeLiveBytes(bytes: Uint8Array): Promise<void>;
   logPacket(direction: PacketDirection, protocol: PacketProtocol, deviceId: string, deviceName: string, bytes: Uint8Array, summary: string, cmd?: number): void;
   getStore(): OfflineStore;
@@ -57,7 +56,35 @@ export function buildWatchHealthDayInput(watch: WatchLiveState): DailyHealthReco
     systolicBp: Math.max(0, watch.bloodPressure.systolic), diastolicBp: Math.max(0, watch.bloodPressure.diastolic),
     stressScore: Math.max(0, watch.stress.score),
     ...(watch.stepBuckets48.length > 0 ? { stepBuckets48: watch.stepBuckets48.slice(0, 48) } : {}),
+    ...(watch.sleep.segments.length > 0 ? { sleepSegments: sleepSegmentTimes(watch.sleep.segments, now) } : {}),
   };
+}
+
+const SLEEP_STAGE_NAME: Record<number, SleepStageName> = {
+  [CRP_SLEEP_STATE.AWAKE]: 'awake', [CRP_SLEEP_STATE.LIGHT]: 'light', [CRP_SLEEP_STATE.DEEP]: 'deep', [CRP_SLEEP_STATE.REM]: 'rem',
+};
+
+/**
+ * The watch reports last night's stages as clock times only. Times after noon
+ * belong to the evening before `today`; earlier ones to `today`.
+ */
+export function sleepSegmentTimes(segments: readonly CrpSleepSegment[], today: Date): SleepSegmentRecord[] {
+  const at = (h: number, m: number): Date => {
+    const d = new Date(today.getFullYear(), today.getMonth(), today.getDate(), h, m, 0, 0);
+    if (h >= 12) d.setDate(d.getDate() - 1);
+    return d;
+  };
+  const out: SleepSegmentRecord[] = [];
+  for (const s of segments) {
+    const stage = SLEEP_STAGE_NAME[s.state];
+    if (!stage) continue;
+    const start = at(s.startHour, s.startMinute);
+    let end = at(s.endHour, s.endMinute);
+    if (end <= start) end = new Date(start.getTime() + Math.max(1, s.durationMinutes) * 60_000);
+    if (end.getTime() > today.getTime()) continue;
+    out.push({ stage, start: start.toISOString(), end: end.toISOString() });
+  }
+  return out;
 }
 
 function applySleepSummary(next: Mutable<WatchLiveState>, sleep: CrpSleepInfo): void {
@@ -120,13 +147,9 @@ function buildEnrichedGpsRoute(
   const distanceMeters = computedDistance > 0 ? computedDistance : (summary?.distanceMeters ?? 0);
   const durationSec = summary && summary.validTimeSeconds > 0 ? summary.validTimeSeconds : Math.max(buffer.waypoints.length * 45, 60);
   const caloriesKcal = summary && summary.caloriesKcal > 0 ? summary.caloriesKcal : Math.max(12, Math.round((distanceMeters / 1000) * 65));
-  const peakBpm = activityType === 'outdoor_run' ? Math.min(182, restingBpm + 88) : Math.min(148, restingBpm + 48);
-  const waypoints: GpsWaypoint[] = buffer.waypoints.map((wp, idx) => {
-    const phase = buffer.waypoints.length > 1 ? idx / (buffer.waypoints.length - 1) : 0;
-    const elev = Math.round((1335 + Math.sin(phase * Math.PI) * 14 + (idx % 3) * 0.6) * 10) / 10;
-    const hr = Math.round(restingBpm + (peakBpm - restingBpm) * (0.45 + 0.55 * Math.sin(phase * Math.PI)));
-    return { ...wp, elevationMeters: wp.elevationMeters ?? elev, heartRateBpm: wp.heartRateBpm ?? hr };
-  });
+  // Keep only what the watch measured; these routes are exported to health apps and Strava.
+  void restingBpm;
+  const waypoints: GpsWaypoint[] = buffer.waypoints.map((wp) => ({ ...wp }));
   const hrs = waypoints.map((w) => w.heartRateBpm).filter((v): v is number => typeof v === 'number');
   const elevs = waypoints.map((w) => w.elevationMeters).filter((v): v is number => typeof v === 'number');
   const elevationGainMeters = elevs.length >= 2
@@ -170,9 +193,7 @@ export class WatchController {
     const parsed = parseCrpFrame(frame);
     const watch = host.getState();
     host.logPacket(PACKET_DIRECTION.TX, PACKET_PROTOCOL.CRREPA, watch.deviceId ?? 'watch', watch.name, frame, summary, parsed?.cmd);
-    if (host.isSimulator()) {
-      for (const rx of host.sendSimulatorWatch(frame)) await this.handleRxBytesAndFollowups(host, rx);
-    } else await host.writeLiveBytes(frame);
+    await host.writeLiveBytes(frame);
   }
 
   async sendSequence(host: WatchTransportHost, frames: readonly Uint8Array[], summaryPrefix: string): Promise<void> {
@@ -218,13 +239,13 @@ export class WatchController {
     this.gpsHistoryResponseSeen = false;
     host.setState(syncWatchState({ ...host.getState(), gpsSyncing: true }));
     host.emit();
-    const liveWaiter = host.isLiveBle() ? this.createPendingGpsSyncWaiter() : null;
+    const liveWaiter = this.createPendingGpsSyncWaiter();
     try {
       await this.sendFrame(host, encodeQueryMovementWorkouts(), 'QueryMovementWorkouts (0x37)');
       await this.sendFrame(host, encodeQueryGpsHistory(), 'QueryGpsHistory (0xB3 0x00)');
       await this.sendFrame(host, encodeQueryGpsLiveLocation(), 'QueryGpsLiveLocation (0xB3 0x02)');
       await this.drainPendingCrpFollowups(host);
-      if (liveWaiter) await liveWaiter;
+      await liveWaiter;
       await this.persistPendingGpsRoutes(host, true);
       host.setState(syncWatchState({ ...host.getState(), gpsRoutes: host.getStore().getGpsRoutes(), gpsSyncing: false, lastSyncedAt: Date.now() }));
       host.emit();
@@ -239,6 +260,20 @@ export class WatchController {
   async persistHealthDay(host: WatchTransportHost): Promise<void> {
     await host.getStore().upsertHealthDay(buildWatchHealthDayInput(host.getState()));
     host.emit();
+  }
+
+  /** Starts (type) or changes the state of a workout on the watch. */
+  async training(host: WatchTransportHost, action: { start: number } | 'pause' | 'resume' | 'stop'): Promise<void> {
+    const t = host.getState().training;
+    if (typeof action === 'object') {
+      host.setState(syncWatchState({ ...host.getState(), training: { ...t, active: true, paused: false, type: action.start, failed: false, bpm: 0, bpmAt: 0 } }));
+      host.emit();
+      await this.sendFrame(host, encodeTrainingStart(action.start), `StartWorkout (type ${action.start})`);
+      return;
+    }
+    host.setState(syncWatchState({ ...host.getState(), training: action === 'stop' ? { ...t, active: false, paused: false } : { ...t, paused: action === 'pause' } }));
+    host.emit();
+    await this.sendFrame(host, encodeTrainingState(action), `Workout ${action}`);
   }
 
   async measureVital(host: WatchTransportHost, kind: 'hr' | 'spo2' | 'bp', start: boolean): Promise<void> {
@@ -416,23 +451,43 @@ export class WatchController {
     } else if (cmd === CRP_CMD.QUERY_TIMING_HEART_RATE || cmd === CRP_CMD.QUERY_24H_HEART_RATE) {
       const hr = decodeHeartRate24h(payload, { kind: cmd === CRP_CMD.QUERY_TIMING_HEART_RATE ? 'timing_5min' : 'continuous_1min' });
       if (hr && hr.values.length > 0) applyHrSeries(next, hr.values);
-    } else if (cmd === CRP_CMD.MEASURE_HEART_RATE || cmd === CRP_CMD.DYNAMIC_HEART_RATE) {
+    } else if (cmd === CRP_CMD.MEASURE_HEART_RATE) {
+      // 0 = still measuring / no contact, 0xFF = invalid.
       const singleHr = decodeHeartRateSingle(payload);
-      if (singleHr && singleHr.bpm > 0) next.heartRate = { ...next.heartRate, currentBpm: singleHr.bpm, samples24h: [...next.heartRate.samples24h, singleHr.bpm] };
+      if (singleHr && singleHr.bpm > 0 && singleHr.bpm < 0xff) {
+        next.heartRate = { ...next.heartRate, currentBpm: singleHr.bpm, measuring: false, samples24h: [...next.heartRate.samples24h, singleHr.bpm] };
+        next.measuringHr = false;
+      }
+    } else if (cmd === CRP_CMD.DYNAMIC_HEART_RATE) {
+      const ev = decodeTrainingNotification(payload);
+      const t = next.training;
+      if (ev?.kind === 'heartRate') {
+        next.training = { ...t, active: true, bpm: ev.bpm, bpmAt: Date.now(), failed: false };
+        next.heartRate = { ...next.heartRate, currentBpm: ev.bpm };
+      } else if (ev?.kind === 'startFailed') {
+        next.training = { ...t, active: false, failed: true };
+      } else if (ev?.kind === 'state') {
+        next.training = ev.state === 'stopped'
+          ? { ...t, active: false, paused: false }
+          : { ...t, active: true, paused: ev.state === 'paused', ...(ev.type !== undefined ? { type: ev.type } : {}), failed: false };
+      }
     } else if (cmd === CRP_CMD.QUERY_24H_SPO2 || cmd === CRP_CMD.MEASURE_SPO2) {
       const spo2 = decodeSpO2(payload, cmd === CRP_CMD.MEASURE_SPO2 ? { kind: 'single' } : { kind: 'chunk' });
-      if (spo2?.kind === 'single' && spo2.spo2 && spo2.spo2 > 0) next.spo2 = { ...next.spo2, percent: spo2.spo2, samples24h: [...next.spo2.samples24h, spo2.spo2] };
+      if (spo2?.kind === 'single' && spo2.spo2 && spo2.spo2 > 0 && spo2.spo2 < 0xff) {
+        next.spo2 = { ...next.spo2, percent: spo2.spo2, measuring: false, samples24h: [...next.spo2.samples24h, spo2.spo2] };
+        next.measuringSpo2 = false;
+      }
       else if (spo2 && spo2.values.length > 0) { const valid = spo2.values.filter((v) => v > 0); if (valid.length > 0) next.spo2 = { ...next.spo2, percent: valid[valid.length - 1]!, samples24h: valid }; }
     } else if (cmd === CRP_CMD.QUERY_24H_BP || cmd === CRP_CMD.MEASURE_BLOOD_PRESSURE) {
       const bp = decodeBloodPressure(payload, cmd === CRP_CMD.MEASURE_BLOOD_PRESSURE ? { kind: 'single' } : { kind: '24h_chunk' });
       if (bp) {
-        const valid = bp.readings.filter((r) => r.systolic > 0 && r.diastolic > 0);
+        const valid = bp.readings.filter((r) => r.systolic > 0 && r.diastolic > 0 && !(r.systolic === 0xff && r.diastolic === 0xff));
         if (valid.length > 0) { const last = valid[valid.length - 1]!; next.bloodPressure = { ...next.bloodPressure, systolic: last.systolic, diastolic: last.diastolic }; }
         if (bp.nextChunkCmd) nextCommand = bp.nextChunkCmd;
       }
     } else if (cmd === CRP_CMD.NEW_PROTOCOL_EXT) this.applyNewProtocolExtRx(next, payload);
     else if (cmd === CRP_CMD.QUERY_ALARMS) { const legacy = decodeAlarms(payload, { isNewProtocol: false }); if (legacy) next.alarms = mapDecodedAlarms(legacy); }
-    else if (cmd === CRP_CMD.QUERY_DEVICE_VERSION) { const fw = decodeUtf8(payload).replace(/\0+$/g, '').trim(); if (fw.length > 0) next.firmwareVersion = fw; }
+    else if (cmd === CRP_CMD.QUERY_DEVICE_VERSION) { const fw = printableAscii(payload); if (fw) next.firmwareVersion = fw; }
     else if (cmd === CRP_CMD.QUERY_SUPPORTED_FUNCTIONS) {
       if (payload.length >= 2) next.functionMask = payload[0]! | (payload[1]! << 8);
       if (payload.length >= 3) next.batteryPercent = clampInt(payload[2]!, 0, 100);

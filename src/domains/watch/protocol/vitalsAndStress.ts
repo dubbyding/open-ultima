@@ -2,7 +2,7 @@
  * ULTIMA Fit — CRREPA Vitals (Heart Rate, Blood Pressure, SpO2) & Stress Codecs
  *
  * Implements single-shot measurements, timing/24h queries, and history decoders
- * for HR (`0x68`/`0x6D`/`0x1F`/`0x35`/`0x36`/`0xB6`/`0xAB`), BP (`0x69`/`0x7E`/`0x3D`/`0xAB`),
+ * for HR (`0x6D` one-shot, `0x68` training mode/`0x1F`/`0x35`/`0x36`/`0xB6`/`0xAB`), BP (`0x69`/`0x7E`/`0x3D`/`0xAB`),
  * SpO2 (`0x6B`/`0x7E`/`0x3E`/`0xAB`), and Stress (`0xB9` subcommands `0x01`/`0x11`).
  */
 
@@ -78,14 +78,70 @@ export interface CrpStressDecoded {
 // Vitals & Stress Command Encoders
 // ---------------------------------------------------------------------------
 
-/** Encodes `0x68` single heart-rate measurement (`0x00` start, `0xFF` stop). */
+/** Encodes `0x6D` one-shot heart-rate measurement (`0x00` start, `0xFF` stop). */
 export function encodeMeasureHeartRate(start: boolean): Uint8Array {
   return buildCrpFrame(CRP_CMD.MEASURE_HEART_RATE, Uint8Array.of(start ? 0x00 : 0xff));
 }
 
-/** Encodes `0x6D` dynamic heart-rate measurement (`0x00` start, `0xFF` stop). */
+/**
+ * Encodes `0x68` training (dynamic heart-rate) mode start/stop. WARNING: starting
+ * this begins a workout on the watch — never use it for a heart-rate reading.
+ */
 export function encodeDynamicHeartRate(start: boolean): Uint8Array {
   return buildCrpFrame(CRP_CMD.DYNAMIC_HEART_RATE, Uint8Array.of(start ? 0x00 : 0xff));
+}
+
+/**
+ * Watch workout ("training") types for `0x68`, from ULTIMA Fit
+ * `gn3.sendStartTrainingByType` (GpsTrainingType → byte).
+ */
+export const CRP_TRAINING_TYPE = {
+  WALKING: 0x00,
+  RUNNING: 0x01,
+  CYCLING: 0x02,
+  TRAIL_RUNNING: 0x14,
+  ON_FOOT: 0x19,
+  INDOOR_WALKING: 0x1a,
+  INDOOR_RUNNING: 0x1b,
+} as const;
+
+/** `0x68` state bytes used by ULTIMA Fit's pause/resume/stopTraining. */
+export const CRP_TRAINING_STATE = { RESUME: 0xfd, PAUSE: 0xfe, STOP: 0xff } as const;
+
+/** Starts a workout of `type` on the watch (`0x68 [type]`), like ULTIMA Fit's phone-led training. */
+export function encodeTrainingStart(type: number): Uint8Array {
+  return buildCrpFrame(CRP_CMD.DYNAMIC_HEART_RATE, Uint8Array.of(type & 0xff));
+}
+
+export function encodeTrainingState(state: 'pause' | 'resume' | 'stop'): Uint8Array {
+  const b = state === 'pause' ? CRP_TRAINING_STATE.PAUSE : state === 'resume' ? CRP_TRAINING_STATE.RESUME : CRP_TRAINING_STATE.STOP;
+  return buildCrpFrame(CRP_CMD.DYNAMIC_HEART_RATE, Uint8Array.of(b));
+}
+
+/**
+ * Decodes a `0x68` notification (ULTIMA Fit `z48.q0`):
+ *   [bpm, 0x01]  live heart rate during a workout ([0xFF, 0x01] = start failed)
+ *   [state]      0xFD resumed, 0xFE paused, 0xFF stopped, otherwise the started type
+ */
+export type CrpTrainingEvent =
+  | { kind: 'heartRate'; bpm: number }
+  | { kind: 'startFailed' }
+  | { kind: 'state'; state: 'started' | 'paused' | 'resumed' | 'stopped'; type?: number };
+
+export function decodeTrainingNotification(payload: Uint8Array): CrpTrainingEvent | null {
+  if (payload.length === 2 && payload[1] === 0x01) {
+    const v = payload[0]!;
+    if (v === 0xff) return { kind: 'startFailed' };
+    return v > 0 ? { kind: 'heartRate', bpm: v } : null;
+  }
+  if (payload.length === 1) {
+    const v = payload[0]!;
+    if (v === CRP_TRAINING_STATE.STOP) return { kind: 'state', state: 'stopped' };
+    if (v === CRP_TRAINING_STATE.PAUSE) return { kind: 'state', state: 'paused' };
+    if (v === CRP_TRAINING_STATE.RESUME) return { kind: 'state', state: 'resumed' };
+    return { kind: 'state', state: 'started', type: v };
+  }
+  return null;
 }
 
 /** Encodes `0x1F` timing heart-rate interval in 5-minute units (`0` disables). */
@@ -192,7 +248,7 @@ function decodeFiveByteTimedSamples<T>(
 }
 
 /**
- * Decodes single heart rate payloads (`0x68` / `0x6D` 1-byte BPM or standard
+ * Decodes single heart rate payloads (`0x6D` 1-byte BPM or standard
  * Bluetooth GATT `0x2A37` Heart Rate Measurement characteristic).
  */
 export function decodeHeartRateSingle(payload: Uint8Array): CrpHeartRateSingleInfo | null {

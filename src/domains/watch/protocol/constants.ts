@@ -110,10 +110,16 @@ export const CRP_CMD = {
   QUERY_DISTANCE_CATEGORY: 0x5d,
 
   FIND_WATCH: 0x61,
-  MEASURE_HEART_RATE: 0x68,
+  /**
+   * Start/stop the watch's *training* (dynamic heart-rate) mode — this starts a
+   * workout on the watch. Reply payload[0] is the workout type, `0xFF` = stopped.
+   * NOT a heart-rate measurement. (Gadgetbridge: CMD_START_STOP_MEASURE_DYNAMIC_RATE = 104)
+   */
+  DYNAMIC_HEART_RATE: 0x68,
   MEASURE_BLOOD_PRESSURE: 0x69,
   MEASURE_SPO2: 0x6b,
-  DYNAMIC_HEART_RATE: 0x6d,
+  /** One-shot heart-rate measurement `[0x00]` start / `[0xFF]` stop → reply `[bpm]`. (Gadgetbridge: CMD_TRIGGER_MEASURE_HEARTRATE = 109) */
+  MEASURE_HEART_RATE: 0x6d,
 
   /** `xa8`: Do-Not-Disturb period `[startH, startM, endH, endM]`. */
   SET_DND_PERIOD: 0x71,
