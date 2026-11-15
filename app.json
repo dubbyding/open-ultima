@@ -1,0 +1,39 @@
+{
+  "expo": {
+    "name": "Ultima Open",
+    "slug": "ultima-open",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": true,
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "org.ultimaopen.companion",
+      "infoPlist": {
+        "NSBluetoothAlwaysUsageDescription": "Ultima Open connects directly over Bluetooth LE to your Ultima earbuds and smartwatch without cloud servers.",
+        "NSBluetoothPeripheralUsageDescription": "Ultima Open communicates with your Ultima wearables over Bluetooth LE."
+      }
+    },
+    "android": {
+      "package": "org.ultimaopen.companion",
+      "permissions": [
+        "android.permission.BLUETOOTH",
+        "android.permission.BLUETOOTH_ADMIN",
+        "android.permission.BLUETOOTH_SCAN",
+        "android.permission.BLUETOOTH_CONNECT",
+        "android.permission.ACCESS_FINE_LOCATION"
+      ]
+    },
+    "plugins": [
+      [
+        "react-native-ble-plx",
+        {
+          "isBackgroundEnabled": true,
+          "modes": ["peripheral", "central"],
+          "bluetoothAlwaysPermission": "Allow Ultima Open to connect to your Ultima earbuds and smartwatch offline."
+        }
+      ],
+      "expo-sqlite"
+    ]
+  }
+}

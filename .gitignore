@@ -1,0 +1,15 @@
+# Dependencies & Expo
+node_modules/
+.expo/
+dist/
+web-build/
+
+# Local env & OS metadata
+.env
+.env.local
+.DS_Store
+**/.DS_Store
+
+# Raw APK/XAPK archives
+*.xapk
+*.apk
