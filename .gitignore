@@ -1,15 +1,55 @@
-# Dependencies & Expo
+# Dependencies
 node_modules/
+
+# Expo
 .expo/
 dist/
 web-build/
+expo-env.d.ts
 
-# Local env & OS metadata
+# Native build & prebuild artifacts
+/ios/
+/android/
+*.orig.*
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+
+# Metro & TypeScript
+.metro-health-check*
+*.tsbuildinfo
+
+# Debug logs
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+pnpm-debug.*
+
+# Local environment & secrets
 .env
 .env.local
+.env.*.local
+
+# Local SQLite databases & exports
+*.db
+*.sqlite
+*.sqlite3
+
+# Test & coverage
+coverage/
+
+# macOS & Editors
 .DS_Store
 **/.DS_Store
+*.pem
+.vscode/
+.idea/
+*.swp
+*.swo
 
-# Raw APK/XAPK archives
+# Raw mobile packages
 *.xapk
 *.apk
+*.ipa
