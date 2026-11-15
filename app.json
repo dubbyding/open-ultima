@@ -4,24 +4,45 @@
     "slug": "ultima-open",
     "version": "1.0.0",
     "orientation": "portrait",
+    "icon": "./assets/icon.png",
     "userInterfaceStyle": "dark",
     "newArchEnabled": true,
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "org.ultimaopen.companion",
+      "bundleIdentifier": "com.nhumark.openultima",
       "infoPlist": {
         "NSBluetoothAlwaysUsageDescription": "Ultima Open connects directly over Bluetooth LE to your Ultima earbuds and smartwatch without cloud servers.",
-        "NSBluetoothPeripheralUsageDescription": "Ultima Open communicates with your Ultima wearables over Bluetooth LE."
+        "NSBluetoothPeripheralUsageDescription": "Ultima Open communicates with your Ultima wearables over Bluetooth LE.",
+        "UIBackgroundModes": [
+          "bluetooth-central",
+          "location"
+        ]
       }
     },
     "android": {
-      "package": "org.ultimaopen.companion",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#0C1B1E"
+      },
+      "package": "com.nhumark.openultima",
       "permissions": [
         "android.permission.BLUETOOTH",
         "android.permission.BLUETOOTH_ADMIN",
         "android.permission.BLUETOOTH_SCAN",
         "android.permission.BLUETOOTH_CONNECT",
-        "android.permission.ACCESS_FINE_LOCATION"
+        "android.permission.ACCESS_FINE_LOCATION",
+        "android.permission.health.WRITE_STEPS",
+        "android.permission.health.WRITE_DISTANCE",
+        "android.permission.health.WRITE_ACTIVE_CALORIES_BURNED",
+        "android.permission.health.WRITE_HEART_RATE",
+        "android.permission.health.WRITE_RESTING_HEART_RATE",
+        "android.permission.health.WRITE_SLEEP",
+        "android.permission.health.WRITE_EXERCISE",
+        "android.permission.health.WRITE_EXERCISE_ROUTE",
+        "android.permission.ACCESS_COARSE_LOCATION",
+        "android.permission.ACCESS_BACKGROUND_LOCATION",
+        "android.permission.FOREGROUND_SERVICE",
+        "android.permission.FOREGROUND_SERVICE_LOCATION"
       ]
     },
     "plugins": [
@@ -29,11 +50,55 @@
         "react-native-ble-plx",
         {
           "isBackgroundEnabled": true,
-          "modes": ["peripheral", "central"],
+          "modes": [
+            "central"
+          ],
           "bluetoothAlwaysPermission": "Allow Ultima Open to connect to your Ultima earbuds and smartwatch offline."
         }
       ],
-      "expo-sqlite"
-    ]
+      "expo-sqlite",
+      "expo-font",
+      "expo-asset",
+      "expo-health-connect",
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "minSdkVersion": 26,
+            "compileSdkVersion": 35,
+            "targetSdkVersion": 35,
+            "kotlinVersion": "1.9.25"
+          }
+        }
+      ],
+      [
+        "react-native-health",
+        {
+          "healthSharePermission": "Ultima Open reads nothing from Health; this permission is required by iOS.",
+          "healthUpdatePermission": "Ultima Open adds the steps, heart rate and workouts your Ultima watch records to Apple Health."
+        }
+      ],
+      "expo-secure-store",
+      [
+        "expo-location",
+        {
+          "locationAlwaysAndWhenInUsePermission": "Ultima Open records your workout route with GPS, including while the screen is off.",
+          "locationWhenInUsePermission": "Ultima Open records your workout route with GPS.",
+          "isAndroidBackgroundLocationEnabled": true,
+          "isAndroidForegroundServiceEnabled": true
+        }
+      ],
+      "@maplibre/maplibre-react-native",
+      [
+        "expo-splash-screen",
+        {
+          "backgroundColor": "#0C1B1E",
+          "image": "./assets/splash-logo.png",
+          "imageWidth": 200,
+          "resizeMode": "contain"
+        }
+      ]
+    ],
+    "scheme": "com.nhumark.openultima"
   }
 }
