@@ -53,3 +53,8 @@ coverage/
 *.xapk
 *.apk
 *.ipa
+
+# Local Expo module build output
+modules/*/android/build/
+modules/*/android/.cxx/
+modules/*/ios/build/
