@@ -10,7 +10,7 @@ import {
   encodeQueryNewAlarms, encodeQueryTimingStress, encodeQueryTodayHeartRate,
   encodeSyncNapSleep, encodeSyncStepCategory, encodeSyncStepsAndSleep, encodeTimeSync, parseCrpFrame,
 } from '../../../protocols/ultimaFitCrrepa.ts';
-import type { CrpMovementWorkoutRecord, CrpSleepSummary } from '../../../protocols/ultimaFitCrrepa.ts';
+import type { CrpMovementWorkoutRecord, CrpSleepInfo } from '../../../protocols/ultimaFitCrrepa.ts';
 import type { DailyHealthRecordInput, GpsWaypoint, GpsWorkoutRoute, OfflineStore, WatchAlarmRecord, WatchSettings } from '../../../storage/offlineStore.ts';
 import { isValidGpsCoordinate, totalPathDistanceMeters } from '../../../utils/geoMath.ts';
 import { PACKET_DIRECTION, PACKET_PROTOCOL, syncWatchState } from '../types.ts';
@@ -60,7 +60,7 @@ export function buildWatchHealthDayInput(watch: WatchLiveState): DailyHealthReco
   };
 }
 
-function applySleepSummary(next: Mutable<WatchLiveState>, sleep: CrpSleepSummary): void {
+function applySleepSummary(next: Mutable<WatchLiveState>, sleep: CrpSleepInfo): void {
   next.sleep = { ...next.sleep, deepMinutes: sleep.deepMinutes, lightMinutes: sleep.lightMinutes, remMinutes: sleep.remMinutes, awakeMinutes: sleep.awakeMinutes, totalMinutes: sleep.totalMinutes, segments: sleep.segments };
 }
 

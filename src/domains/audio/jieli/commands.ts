@@ -293,7 +293,7 @@ export function encodeJieliGetAdvInfo(opCodeSn: number, mask = 0xffffffff): Uint
 export function encodeJieliGetSysInfo(
   opCodeSn: number,
   mask: number,
-  fnType = JIELI_ATTR_AND_FUN.SYS_INFO_FUNCTION_PUBLIC,
+  fnType: number = JIELI_ATTR_AND_FUN.SYS_INFO_FUNCTION_PUBLIC,
 ): Uint8Array {
   const paramData = new Uint8Array([
     fnType & 0xff,

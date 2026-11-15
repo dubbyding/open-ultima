@@ -389,7 +389,7 @@ export function decodeSleepSegments(
   const remMinutes = totals[CRP_SLEEP_STATE.REM]!;
 
   return {
-    format,
+    format: format === '3byte' ? '3byte' : '2byte',
     ...(dayOffset !== undefined ? { dayOffset } : {}),
     deepMinutes,
     lightMinutes,
