@@ -19,10 +19,10 @@ import {
   encodeJieliDeviceName, encodeJieliGetAdvInfo, encodeJieliGetSysInfo, encodeJieliInEarDetect,
   encodeJieliKeySettings, encodeJieliLanguage, encodeJieliLedSettings, encodeJieliSearchDev,
   encodeJieliUltimaEqPreset, encodeJieliUltimaEqQuery, encodeJieliWorkMode,
-  parseJieliCustomData, parseJieliLtvEntries, parseJieliRcspPacket,
+  parseJieliCustomData, parseJieliLtvEntries, parseJieliRcspPacket, packJieliRcspPacket, encodeJieliSetSysInfo,
 } from '../../../protocols/ultimaLinkJieli.ts';
 import type { JieliKeySetting } from '../../../protocols/ultimaLinkJieli.ts';
-import { ANC_MODE, EQ_BAND_COUNT, VOICE_LANGUAGE, createDefaultEarbudPrefs } from '../../../storage/offlineStore.ts';
+import { ANC_MODE, EARBUD_KEY_FUNCTION, EQ_BAND_COUNT, VOICE_LANGUAGE, createDefaultEarbudPrefs } from '../../../storage/offlineStore.ts';
 import type { AncMode, CaseGesture, EarbudGesture, EarbudKeyFunction } from '../../../storage/offlineStore.ts';
 import { PACKET_DIRECTION, PACKET_PROTOCOL, cloneEarbudKeyMappings, createCaseKeyControl, syncEarbudsState } from '../types.ts';
 import type { EarbudsLiveState, Mutable, PacketDirection, PacketProtocol } from '../types.ts';
@@ -41,6 +41,22 @@ export const BLUETRUM_CASE_KEY_TYPE_MAP: Record<CaseGesture, CaseKeyType> = {
 
 export const JIELI_ACTION_BY_GESTURE: Record<EarbudGesture, number> = { single: 1, double: 2, triple: 3, longPress: 4 };
 export const GESTURE_BY_JIELI_ACTION: Record<number, EarbudGesture> = { 1: 'single', 2: 'double', 3: 'triple', 4: 'longPress' };
+
+/**
+ * Jieli key functions as Ultima Link sends them (`UiFunction`: NONE 0, PLAY_OR_PAUSE 5,
+ * PREVIOUS_SONG 3, NEXT_SONG 4, INCREASE_VOLUME 9, DECREASE_VOLUME 10), mapped to the app's codes.
+ */
+const JIELI_FN_TO_APP: Record<number, EarbudKeyFunction> = {
+  0: EARBUD_KEY_FUNCTION.NONE, 5: EARBUD_KEY_FUNCTION.PLAY_PAUSE, 3: EARBUD_KEY_FUNCTION.PREVIOUS,
+  4: EARBUD_KEY_FUNCTION.NEXT, 9: EARBUD_KEY_FUNCTION.VOLUME_UP, 10: EARBUD_KEY_FUNCTION.VOLUME_DOWN,
+};
+const APP_FN_TO_JIELI: Partial<Record<EarbudKeyFunction, number>> = Object.fromEntries(
+  Object.entries(JIELI_FN_TO_APP).map(([wire, app]) => [app, Number(wire)]),
+) as Partial<Record<EarbudKeyFunction, number>>;
+
+/** Jieli public SysInfo attributes for noise control (SDK CommandBuilder: masks 0x2000 / 0x4000). */
+const JIELI_SYS_ATTR_VOICE_MODE = 0x0d;
+const JIELI_SYS_ATTR_VOICE_MODE_LIST = 0x0e;
 
 export const ANC_PROTOCOL_TO_STORE: Record<number, AncMode> = {
   [PROTOCOL_ANC_MODE.OFF]: ANC_MODE.OFF, [PROTOCOL_ANC_MODE.ANC]: ANC_MODE.ANC, [PROTOCOL_ANC_MODE.TRANSPARENCY]: ANC_MODE.TRANSPARENCY,
@@ -80,9 +96,6 @@ export interface PendingEqContext {
 export interface EarbudsTransportHost {
   getState(): EarbudsLiveState;
   setState(next: EarbudsLiveState): void;
-  isSimulator(): boolean;
-  sendSimulatorBluetrum(frame: Uint8Array): Uint8Array[];
-  sendSimulatorJieli(packet: Uint8Array): Uint8Array[];
   writeLiveBytes(chip: DeviceChip, bytes: Uint8Array): Promise<void>;
   logPacket(direction: PacketDirection, protocol: PacketProtocol, deviceId: string, deviceName: string, bytes: Uint8Array, summary: string, cmd?: number): void;
   setError(message: string): void;
@@ -112,11 +125,7 @@ export class EarbudsController {
 
     for (const frame of frames) {
       host.logPacket(PACKET_DIRECTION.TX, PACKET_PROTOCOL.BLUETRUM, deviceId, state.name, frame, summary, command.cmd);
-      if (host.isSimulator()) {
-        for (const rx of host.sendSimulatorBluetrum(frame)) this.handleBluetrumRxBytes(host, rx);
-      } else {
-        await host.writeLiveBytes(DEVICE_CHIP.BT, frame);
-      }
+      await host.writeLiveBytes(DEVICE_CHIP.BT, frame);
     }
   }
 
@@ -127,11 +136,7 @@ export class EarbudsController {
     const parsed = parseJieliRcspPacket(packet);
     const state = host.getState();
     host.logPacket(PACKET_DIRECTION.TX, PACKET_PROTOCOL.JIELI, state.deviceId ?? 'earbuds', state.name, packet, summary, parsed?.opCode);
-    if (host.isSimulator()) {
-      for (const rx of host.sendSimulatorJieli(packet)) this.handleJieliRxBytes(host, rx);
-    } else {
-      await host.writeLiveBytes(DEVICE_CHIP.JL, packet);
-    }
+    await host.writeLiveBytes(DEVICE_CHIP.JL, packet);
   }
 
   async refreshInfo(host: EarbudsTransportHost, chip: DeviceChip): Promise<void> {
@@ -139,20 +144,55 @@ export class EarbudsController {
     await this.sendJieliPacket(host, (sn) => encodeJieliGetAdvInfo(sn), 'Jieli GetADVInfo (0xC1)');
     await this.sendJieliPacket(host, (sn) => encodeJieliUltimaEqQuery(sn), 'Jieli UltimaEqQuery (0xFF [0x10])');
     await this.sendJieliPacket(host, (sn) => encodeJieliGetSysInfo(sn, 1 << JIELI_ATTR_AND_FUN.SYS_INFO_ATTR_EQ), 'Jieli GetSysInfo EQ (0x07)');
+    // Noise control: all supported modes (with gain ranges) + the current one (SDK buildGetAllVoiceModes / buildGetCurrentVoiceMode).
+    await this.sendJieliPacket(host, (sn) => encodeJieliGetSysInfo(sn, (1 << JIELI_SYS_ATTR_VOICE_MODE_LIST) | (1 << JIELI_SYS_ATTR_VOICE_MODE)), 'Jieli GetSysInfo noise control (0x07)');
   }
 
   async setAncMode(host: EarbudsTransportHost, chip: DeviceChip, mode: 'off' | 'anc' | 'transparency'): Promise<void> {
     const p = ANC_STORE_TO_PROTOCOL[mode];
-    await this.sendChip(host, chip, encodeBluetrumAncMode(p), `SetANCMode (${mode})`, (sn) => encodeJieliAncMode(p, sn), `Jieli SetANCMode (${mode})`);
+    if (chip === DEVICE_CHIP.BT) { await this.sendBluetrumCommand(host, encodeBluetrumAncMode(p), `SetANCMode (${mode})`); return; }
+    await this.sendJieliVoiceMode(host, this.jieliVoiceModeBlob(p), `Jieli SetNoiseMode (${mode})`);
+    host.setState(syncEarbudsState({ ...host.getState(), ancMode: mode }));
+    host.emit();
+  }
+
+  /** Last known 9-byte VoiceMode per mode: [mode, leftMax, rightMax, leftCur, rightCur] (uint16 BE each). */
+  private jieliVoiceModes = new Map<number, Uint8Array>();
+
+  private jieliVoiceModeBlob(mode: number, gain?: number): Uint8Array {
+    const blob = Uint8Array.from(this.jieliVoiceModes.get(mode) ?? Uint8Array.of(mode, 0, 0, 0, 0, 0, 0, 0, 0));
+    blob[0] = mode;
+    if (gain !== undefined) {
+      const g = clampInt(gain, 0, 0xffff);
+      blob[5] = (g >> 8) & 0xff; blob[6] = g & 0xff; blob[7] = (g >> 8) & 0xff; blob[8] = g & 0xff;
+    }
+    return blob;
+  }
+
+  private async sendJieliVoiceMode(host: EarbudsTransportHost, blob: Uint8Array, summary: string): Promise<void> {
+    await this.sendJieliPacket(host, (sn) => encodeJieliSetSysInfo(JIELI_ATTR_AND_FUN.SYS_INFO_FUNCTION_PUBLIC, [{ type: JIELI_SYS_ATTR_VOICE_MODE, data: blob }], sn), summary);
+    this.jieliVoiceModes.set(blob[0]!, Uint8Array.from(blob));
   }
 
   async setAncGain(host: EarbudsTransportHost, chip: DeviceChip, gain: number): Promise<void> {
     const g = clampInt(gain, 0, host.getState().ancGainMax || 10);
+    if (chip === DEVICE_CHIP.JL) {
+      await this.sendJieliVoiceMode(host, this.jieliVoiceModeBlob(PROTOCOL_ANC_MODE.ANC, g), `Jieli NoiseCancelLevel (${g})`);
+      host.setState(syncEarbudsState({ ...host.getState(), ancMode: ANC_MODE.ANC, ancGain: g }));
+      host.emit();
+      return;
+    }
     await this.dispatchBtOrJieliCustom(host, chip, encodeBluetrumAncGain(g), `SetANCGain (${g})`, Uint8Array.of(0x20, g & 0xff), `Jieli Custom ANCGain (${g})`, { ancGain: g });
   }
 
   async setTransparencyGain(host: EarbudsTransportHost, chip: DeviceChip, gain: number): Promise<void> {
     const g = clampInt(gain, 0, host.getState().transparencyGainMax || 10);
+    if (chip === DEVICE_CHIP.JL) {
+      await this.sendJieliVoiceMode(host, this.jieliVoiceModeBlob(PROTOCOL_ANC_MODE.TRANSPARENCY, g), `Jieli TransparencyLevel (${g})`);
+      host.setState(syncEarbudsState({ ...host.getState(), ancMode: ANC_MODE.TRANSPARENCY, transparencyGain: g }));
+      host.emit();
+      return;
+    }
     await this.dispatchBtOrJieliCustom(host, chip, encodeBluetrumTransparencyGain(g), `SetTransparencyGain (${g})`, Uint8Array.of(0x21, g & 0xff), `Jieli Custom TransparencyGain (${g})`, { transparencyGain: g });
   }
 
@@ -170,8 +210,8 @@ export class EarbudsController {
 
     const current = host.getState();
     const isSig = lowerName === 'signature sound' || lowerName === 'signature';
-    const isBal = lowerName === 'balance sound' || lowerName === 'balance';
-    if ((current.product?.supportsSignatureBalanceEq ?? false) && (isSig || isBal)) {
+    const isBal = lowerName === 'balance sound' || lowerName === 'balance' || lowerName === 'balanced';
+    if ((current.product?.supportsSignatureBalanceEq ?? current.featureSupport?.signatureBalanceEq ?? false) && (isSig || isBal)) {
       const jieliPreset = isSig ? 'signature' : 'balance';
       const factory = getFactoryPresetsForProduct(current.pid ?? 0x0001);
       const factoryGains = normalizeEqGains(isSig ? factory.signatureSound : factory.balanceSound);
@@ -223,12 +263,19 @@ export class EarbudsController {
       await this.sendBluetrumCommand(host, encodeBluetrumKeyMapping(BLUETRUM_KEY_TYPE_MAP[side][gesture], safeFn), `SetKeyMapping (${side}.${gesture}=0x${safeFn.toString(16)})`);
       return;
     }
-    const nextMappings = cloneEarbudKeyMappings(host.getState().keyMappings);
+    if (APP_FN_TO_JIELI[safeFn] === undefined) throw new Error('These earbuds can’t do that action.');
+    const current = host.getState();
+    const supported = current.featureSupport?.gestures;
+    if (supported && !supported.includes(gesture)) throw new Error('These earbuds don’t support that gesture.');
+    const nextMappings = cloneEarbudKeyMappings(current.keyMappings);
     nextMappings[side][gesture] = safeFn;
     const entries: JieliKeySetting[] = [];
     for (const [sIdx, s] of (['left', 'right'] as const).entries()) {
       for (const [g, fn] of Object.entries(nextMappings[s])) {
-        if (fn !== undefined) entries.push({ keyNum: sIdx + 1, action: JIELI_ACTION_BY_GESTURE[g as EarbudGesture], fn });
+        // Only send gestures the earbuds reported; unknown ones get them to reject the whole write.
+        if (supported && !supported.includes(g as EarbudGesture)) continue;
+        const wire = APP_FN_TO_JIELI[fn as EarbudKeyFunction];
+        if (wire !== undefined) entries.push({ keyNum: sIdx + 1, action: JIELI_ACTION_BY_GESTURE[g as EarbudGesture], fn: wire });
       }
     }
     await this.sendJieliPacket(host, (sn) => encodeJieliKeySettings(entries, sn), `Jieli SetKeyMapping (${side}.${gesture}=0x${safeFn.toString(16)})`);
@@ -310,6 +357,11 @@ export class EarbudsController {
   handleJieliRxBytes(host: EarbudsTransportHost, raw: Uint8Array): void {
     const current = host.getState();
     const pkt = parseJieliRcspPacket(raw);
+    if (pkt?.isCommand && pkt.wantsResponse) {
+      // The earbuds resend notifications (e.g. EQ changed on the buds) until we acknowledge them.
+      const ack = packJieliRcspPacket({ isCommand: false, wantsResponse: false, opCode: pkt.opCode, opCodeSn: pkt.opCodeSn, status: 0 });
+      void host.writeLiveBytes(DEVICE_CHIP.JL, ack).catch(() => undefined);
+    }
     host.logPacket(PACKET_DIRECTION.RX, PACKET_PROTOCOL.JIELI, current.deviceId ?? 'earbuds', current.name, raw, pkt ? `Jieli RX opCode=0x${pkt.opCode.toString(16)} sn=${pkt.opCodeSn}` : `Jieli RX (${raw.length} B)`, pkt?.opCode);
     if (!pkt) return;
     if (!pkt.isCommand && pkt.status !== undefined && pkt.status !== 0) {
@@ -323,6 +375,9 @@ export class EarbudsController {
       next = this.applyJieliAdvInfo(next, pkt.paramData);
     } else if (pkt.opCode === JIELI_OPCODE.EXTRA_CUSTOM) {
       const custom = parseJieliCustomData(pkt.paramData);
+      if (custom?.kind === 'eq_preset' && next.featureSupport && !next.featureSupport.signatureBalanceEq) {
+        next = { ...next, featureSupport: { ...next.featureSupport, signatureBalanceEq: true } };
+      }
       if (custom?.kind === 'eq_preset') {
         const factory = getFactoryPresetsForProduct(next.pid ?? 0x0001);
         const isSig = custom.preset === 'signature';
@@ -333,7 +388,7 @@ export class EarbudsController {
         };
         this.pendingEqContext = null;
       }
-    } else if (pkt.opCode === JIELI_OPCODE.GET_SYS_INFO || pkt.opCode === JIELI_OPCODE.SET_SYS_INFO) {
+    } else if (pkt.opCode === JIELI_OPCODE.GET_SYS_INFO || pkt.opCode === JIELI_OPCODE.SET_SYS_INFO || pkt.opCode === JIELI_OPCODE.SYS_INFO_AUTO_UPDATE) {
       const res = this.applyJieliSysInfoEq(next, pkt.opCode, pkt.paramData);
       if (res.error) { host.setError(res.error); host.emit(); return; }
       next = res.state;
@@ -418,7 +473,35 @@ export class EarbudsController {
 
   private applyJieliAdvInfo(current: EarbudsLiveState, paramData: Uint8Array): EarbudsLiveState {
     const next: Mutable<EarbudsLiveState> = { ...current };
-    for (const entry of parseJieliLtvEntries(paramData)) {
+    const entries = parseJieliLtvEntries(paramData);
+    const types = new Set(entries.map((e) => e.type));
+    if (types.size > 0) {
+      const gestures = new Set<EarbudGesture>();
+      const keys = entries.find((e) => e.type === JIELI_ATTR_AND_FUN.ADV_TYPE_KEY_SETTINGS)?.value;
+      for (let i = 0; keys && i + 2 < keys.length; i += 3) {
+        const g = GESTURE_BY_JIELI_ACTION[keys[i + 1]!];
+        if (g) gestures.add(g);
+      }
+      const modesValue = entries.find((e) => e.type === JIELI_ATTR_AND_FUN.ADV_TYPE_ANC_MODE_LIST)?.value;
+      const modes = modesValue && modesValue.length >= 4
+        ? ((modesValue[0]! << 24) | (modesValue[1]! << 16) | (modesValue[2]! << 8) | modesValue[3]!) >>> 0
+        : 0;
+      const prev = current.featureSupport;
+      next.featureSupport = {
+        gestures: [...gestures],
+        keyFunctions: Object.values(JIELI_FN_TO_APP),
+        anc: (modes & (1 << PROTOCOL_ANC_MODE.ANC)) !== 0,
+        transparency: (modes & (1 << PROTOCOL_ANC_MODE.TRANSPARENCY)) !== 0,
+        ancLevels: false,
+        gameMode: types.has(JIELI_ATTR_AND_FUN.ADV_TYPE_WORK_MODE),
+        inEarDetect: types.has(JIELI_ATTR_AND_FUN.ADV_TYPE_IN_EAR_CHECK),
+        led: types.has(JIELI_ATTR_AND_FUN.ADV_TYPE_LED_SETTINGS),
+        language: types.has(JIELI_ATTR_AND_FUN.ADV_TYPE_LANGUAGE),
+        ldac: false, spatialAudio: false, dualConnect: false, caseKeys: false,
+        signatureBalanceEq: prev?.signatureBalanceEq ?? current.product?.supportsSignatureBalanceEq ?? false,
+      };
+    }
+    for (const entry of entries) {
       if (entry.type === JIELI_ATTR_AND_FUN.ADV_TYPE_BATTERY_QUANTITY) {
         next.battery = {
           left: (entry.value[0] ?? next.battery.left) & 0x7f, leftCharging: ((entry.value[0] ?? 0) & 0x80) !== 0,
@@ -433,8 +516,8 @@ export class EarbudsController {
         for (let i = 0; i + 2 < entry.value.length; i += 3) {
           const side = entry.value[i] === 1 ? 'left' : entry.value[i] === 2 ? 'right' : null;
           const gesture = GESTURE_BY_JIELI_ACTION[entry.value[i + 1]!];
-          const fn = entry.value[i + 2]!;
-          if (side && gesture && fn >= 0 && fn <= 9) updated[side][gesture] = fn as EarbudKeyFunction;
+          const fn = JIELI_FN_TO_APP[entry.value[i + 2]!];
+          if (side && gesture && fn !== undefined) updated[side][gesture] = fn;
         }
         next.keyMappings = updated;
       } else if (entry.type === JIELI_ATTR_AND_FUN.ADV_TYPE_LED_SETTINGS && entry.value.length >= 2) {
@@ -447,11 +530,22 @@ export class EarbudsController {
         next.voiceLanguage = entry.value.length === 1 && entry.value[0]! <= 1
           ? (entry.value[0]! === 1 ? VOICE_LANGUAGE.ZH : VOICE_LANGUAGE.EN)
           : (decodeUtf8(entry.value).toLowerCase().startsWith('zh') ? VOICE_LANGUAGE.ZH : VOICE_LANGUAGE.EN);
-      } else if (entry.type === JIELI_ATTR_AND_FUN.ADV_TYPE_ANC_MODE_LIST && entry.value.length >= 1) {
-        next.ancMode = ANC_PROTOCOL_TO_STORE[entry.value[0]!] ?? ANC_MODE.OFF;
       }
+      // ADV type 0x0A is the *supported* noise modes bitmask (uint32), not the current mode —
+      // the current mode comes from SysInfo attr 0x0D.
     }
     return next;
+  }
+
+  private applyJieliVoiceMode(next: Mutable<EarbudsLiveState>, vm: Uint8Array, isCurrent: boolean): void {
+    const mode = vm[0]!;
+    const u16 = (i: number): number => ((vm[i]! << 8) | vm[i + 1]!) & 0xffff;
+    this.jieliVoiceModes.set(mode, Uint8Array.from(vm));
+    const max = Math.max(u16(1), u16(3));
+    const cur = u16(5);
+    if (mode === PROTOCOL_ANC_MODE.ANC && max > 0) { next.ancGainMax = max; next.ancGain = Math.min(cur, max); }
+    if (mode === PROTOCOL_ANC_MODE.TRANSPARENCY && max > 0) { next.transparencyGainMax = max; next.transparencyGain = Math.min(cur, max); }
+    if (isCurrent) next.ancMode = ANC_PROTOCOL_TO_STORE[mode] ?? ANC_MODE.OFF;
   }
 
   private applyJieliSysInfoEq(current: EarbudsLiveState, opCode: number, paramData: Uint8Array): { state: EarbudsLiveState; error?: string } {
@@ -459,6 +553,17 @@ export class EarbudsController {
     if (paramData.length < 3) return { state: next };
     const body = paramData.subarray(1);
     for (const attr of parseJieliLtvEntries(body)) {
+      if (attr.type === JIELI_SYS_ATTR_VOICE_MODE && attr.value.length >= 9) {
+        this.applyJieliVoiceMode(next, attr.value.subarray(0, 9), true);
+        continue;
+      }
+      if (attr.type === JIELI_SYS_ATTR_VOICE_MODE_LIST && attr.value.length >= 1) {
+        const count = attr.value[0]!;
+        for (let i = 0; i < count && 1 + (i + 1) * 9 <= attr.value.length; i++) {
+          this.applyJieliVoiceMode(next, attr.value.subarray(1 + i * 9, 1 + (i + 1) * 9), false);
+        }
+        continue;
+      }
       if (attr.type !== JIELI_ATTR_AND_FUN.SYS_INFO_ATTR_EQ || attr.value.length < 2) continue;
       const rawMode = attr.value[0]!;
       const modeByte = rawMode & 0x7f;
@@ -476,7 +581,7 @@ export class EarbudsController {
       next.eqGains = normalized;
       next.eqCrcHex = computedCrcHex;
       if (match) { next.eqPresetName = this.pendingEqContext!.presetName; this.pendingEqContext = null; }
-      else if (opCode === JIELI_OPCODE.SET_SYS_INFO || !next.product?.supportsSignatureBalanceEq) {
+      else if (opCode === JIELI_OPCODE.SET_SYS_INFO || !(next.product?.supportsSignatureBalanceEq ?? next.featureSupport?.signatureBalanceEq)) {
         next.eqPresetName = modeByte === 0 && arraysEqual(normalized, EQ_PRESETS.FLAT) ? 'Flat' : 'Custom';
       }
     }

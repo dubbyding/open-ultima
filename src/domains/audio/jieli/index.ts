@@ -50,3 +50,16 @@ export type {
   JieliUltimaEqPresetName,
   JieliUltimaEqValue,
 } from './commands.ts';
+
+export {
+  JIELI_AUTH_ADDRESS,
+  JIELI_AUTH_LINK_KEY,
+  JIELI_AUTH_OK,
+  JIELI_AUTH_RESET_FLAG,
+  bluetoothE1,
+  isJieliAuthMessage,
+  isJieliAuthOk,
+  jieliAuthChallenge,
+  jieliAuthResponse,
+  saferAr,
+} from './auth.ts';
